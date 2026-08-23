@@ -1,0 +1,2241 @@
+---
+title: "Red Sea"
+author: '25062476'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ismev) # Coles Package
+library(evmissing) # Simpson & Northrop package 
+library(readr) # for csv and things 
+library(ggplot2)
+library(patchwork)
+
+set.seed(123)
+
+load("Red_Sea_data.RData")
+load("Red_Sea_weekly.RData")
+```
+
+# Version here for Red Sea data and everything
+I have added a new section to my code that lets weekly samples to be made rather than only monthly in an attempt to improve the red sea data 
+New additions for it with the loading of the cleaned versions of the data and other data frames from before for easy access
+
+# Helper functions for the rest of the chunks in this markdown 
+```{r Functions}
+x_samples <- function(n_samples, mu, sigma) {
+  month_days  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
+  month_index <- rep(1:12, times = month_days)
+  month_index <- rep(month_index, n_samples/365)
+  rnorm(length(month_index), mean = mu[month_index], sd = sigma[month_index])
+}
+
+x_samples_weekly <- function(n_samples, mu, sigma) {
+  week_days  <- rep(7,51)
+  week_days <- c(week_days,8)
+  week_index <- rep(1:52, times = week_days)
+  week_index <- rep(week_index, n_samples/365)
+  rnorm(length(week_index), mean = mu[week_index], sd = sigma[week_index])
+}
+
+block_max <- function(x, block_size) {
+  as.numeric(tapply(x, (seq_along(x) - 1) %/% block_size, max))
+}
+
+delta_rl_CI <- function(T, fit) {
+  mu    <- fit$mle[1]
+  sigma <- fit$mle[2]
+  xi    <- fit$mle[3]
+  V     <- fit$cov
+  y     <- -log(1 - 1/T)
+
+  if (abs(xi) < 1e-6) {
+    rl     <- mu - sigma * log(y)
+    var_rl <- V[1,1] + (log(y))^2 * V[2,2] - 2 * log(y) * V[1,2]
+  } else {
+    rl      <- mu + (sigma/xi) * (y^(-xi) - 1)
+    grad_rl <- c(1, (y^(-xi) - 1)/xi, sigma * (1 - y^(-xi) - xi * y^(-xi) * log(y))/xi^2)
+    var_rl  <- as.numeric(t(grad_rl) %*% V %*% grad_rl)
+  }
+
+  se_rl <- sqrt(var_rl)
+  data.frame(ReturnLevel = rl, Lower = rl - 1.96 * se_rl, Upper = rl + 1.96 * se_rl)
+}
+
+delta_prof_week <- function(GEV_samples, n_samples, q_samples, T, mu, sigma) {
+  
+  x_true <- x_samples_weekly(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+
+  cat("True return level (T =", T, "):", round(true_rl, 4), "\n")
+
+  # Results storage — one row per simulation
+  results <- data.frame(
+    delta_rl    = numeric(n_samples),
+    delta_lower = numeric(n_samples),
+    delta_upper = numeric(n_samples),
+    prof_rl     = numeric(n_samples),
+    prof_lower  = numeric(n_samples),
+    prof_upper  = numeric(n_samples)
+  )
+
+  delta_fail     <- 0L
+  profile_fail   <- 0L
+  profileci_fail <- 0L
+
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+
+    x_dummy  <- x_samples_weekly(GEV_samples, mu, sigma)
+    bm_dummy <- block_max(x_dummy, 365)
+
+    # Delta method
+    fit_delta <- tryCatch(
+      suppressWarnings(gev.fit(bm_dummy, show = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_delta)) {
+      delta_fail <- delta_fail + 1L
+      results[i, c("delta_rl", "delta_lower", "delta_upper")] <- NA
+    } else {
+      ci <- delta_rl_CI(T, fit_delta)
+      results[i, "delta_rl"]    <- ci$ReturnLevel
+      results[i, "delta_lower"] <- ci$Lower
+      results[i, "delta_upper"] <- ci$Upper
+    }
+
+    # Profile likelihood
+    fit_prof <- tryCatch(
+      suppressWarnings(gev_mle(bm_dummy, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+    } else {
+      prof_return <- gev_return(fit_prof, m = T)
+      prof_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+      } else {
+        results[i, "prof_rl"]    <- as.numeric(prof_return)
+        results[i, "prof_lower"] <- prof_conf[1, 1]
+        results[i, "prof_upper"] <- prof_conf[1, 2]
+      }
+    }
+  }
+
+  # Summary
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+
+    delta_rl   = mean(results$delta_rl,  na.rm = TRUE),
+    prof_rl    = mean(results$prof_rl,   na.rm = TRUE),
+
+    RMSE_delta = sqrt(mean((results$delta_rl - true_rl)^2, na.rm = TRUE)),
+    RMSE_prof  = sqrt(mean((results$prof_rl  - true_rl)^2, na.rm = TRUE)),
+
+    Bias_delta     = mean(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof      = mean(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Bias_delta_med = median(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof_med  = median(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Coverage_delta = mean(results$delta_lower <= true_rl &
+                          results$delta_upper >= true_rl, na.rm = TRUE),
+    Coverage_prof  = mean(results$prof_lower  <= true_rl &
+                          results$prof_upper  >= true_rl, na.rm = TRUE),
+    
+    delta_width    = mean(results$delta_upper - results$delta_lower, na.rm=TRUE),
+    prof_width     = mean(results$prof_upper - results$prof_lower, na.rm=TRUE)
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,        # full simulation results if you need them
+    true_rl            = true_rl,
+    delta_failures     = delta_fail,
+    profile_failures   = profile_fail,
+    profileci_failures = profileci_fail,
+    delta_failure_rate   = delta_fail     / n_samples,
+    profile_failure_rate = profile_fail   / n_samples
+  )
+}
+
+delta_prof_month <- function(GEV_samples, n_samples, q_samples, T, mu, sigma) {
+  
+  x_true <- x_samples(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+
+  cat("True return level (T =", T, "):", round(true_rl, 4), "\n")
+
+  # Results storage — one row per simulation
+  results <- data.frame(
+    delta_rl    = numeric(n_samples),
+    delta_lower = numeric(n_samples),
+    delta_upper = numeric(n_samples),
+    prof_rl     = numeric(n_samples),
+    prof_lower  = numeric(n_samples),
+    prof_upper  = numeric(n_samples)
+  )
+
+  delta_fail     <- 0L
+  profile_fail   <- 0L
+  profileci_fail <- 0L
+
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+
+    x_dummy  <- x_samples(GEV_samples, mu, sigma)
+    bm_dummy <- block_max(x_dummy, 365)
+
+    # Delta method
+    fit_delta <- tryCatch(
+      suppressWarnings(gev.fit(bm_dummy, show = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_delta)) {
+      delta_fail <- delta_fail + 1L
+      results[i, c("delta_rl", "delta_lower", "delta_upper")] <- NA
+    } else {
+      ci <- delta_rl_CI(T, fit_delta)
+      results[i, "delta_rl"]    <- ci$ReturnLevel
+      results[i, "delta_lower"] <- ci$Lower
+      results[i, "delta_upper"] <- ci$Upper
+    }
+
+    # Profile likelihood
+    fit_prof <- tryCatch(
+      suppressWarnings(gev_mle(bm_dummy, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+    } else {
+      prof_return <- gev_return(fit_prof, m = T)
+      prof_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+      } else {
+        results[i, "prof_rl"]    <- as.numeric(prof_return)
+        results[i, "prof_lower"] <- prof_conf[1, 1]
+        results[i, "prof_upper"] <- prof_conf[1, 2]
+      }
+    }
+  }
+
+  # Summary
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+
+    delta_rl   = mean(results$delta_rl,  na.rm = TRUE),
+    prof_rl    = mean(results$prof_rl,   na.rm = TRUE),
+
+    RMSE_delta = sqrt(mean((results$delta_rl - true_rl)^2, na.rm = TRUE)),
+    RMSE_prof  = sqrt(mean((results$prof_rl  - true_rl)^2, na.rm = TRUE)),
+
+    Bias_delta     = mean(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof      = mean(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Bias_delta_med = median(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof_med  = median(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Coverage_delta = mean(results$delta_lower <= true_rl &
+                          results$delta_upper >= true_rl, na.rm = TRUE),
+    Coverage_prof  = mean(results$prof_lower  <= true_rl &
+                          results$prof_upper  >= true_rl, na.rm = TRUE),
+    
+    delta_width    = mean(results$delta_upper - results$delta_lower, na.rm=TRUE),
+    prof_width     = mean(results$prof_upper - results$prof_lower, na.rm=TRUE)
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,        # full simulation results if you need them
+    true_rl            = true_rl,
+    delta_failures     = delta_fail,
+    profile_failures   = profile_fail,
+    profileci_failures = profileci_fail,
+    delta_failure_rate   = delta_fail     / n_samples,
+    profile_failure_rate = profile_fail   / n_samples
+  )
+}
+
+coverage_plots <- function(raw, true_rl) {
+  
+  raw     <- raw
+  true_rl <- true_rl
+  
+  n <- nrow(raw)
+  raw$iteration <- seq_len(n)
+  
+  raw$delta_covers <- raw$delta_lower <= true_rl & raw$delta_upper >= true_rl
+  raw$prof_covers  <- raw$prof_lower  <= true_rl & raw$prof_upper  >= true_rl
+  
+  # ── Delta plot ────────────────────────────────────────────────────────────────
+  p_delta <- ggplot(raw, aes(x = iteration, colour = delta_covers)) +
+  
+    geom_linerange(aes(ymin = delta_lower, ymax = delta_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = delta_rl), shape = 16, size = 1.5, alpha = 0.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", hjust = 0.5),
+      legend.position  = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin    = margin(4, 6, 4, 6)
+    )
+  
+  # ── Profile plot ──────────────────────────────────────────────────────────────
+  p_prof <- ggplot(raw, aes(x = iteration, colour = prof_covers)) +
+  
+    geom_linerange(aes(ymin = prof_lower, ymax = prof_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = prof_rl), shape = 16, size = 1.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor  = element_blank(),
+      plot.title        = element_text(face = "bold", hjust = 0.5),
+      legend.position   = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin     = margin(4, 6, 4, 6)
+    )
+  
+  list(
+    delta   = p_delta,
+    profile = p_prof
+  )
+}
+
+
+```
+
+# Working on the Red Seas temperatures 
++ No missing data
++ No leap year (365 days for all years)
+
+UNDERSTANDING and summary
+
+We have 16 years of temperature data 
+This has its respective monthly mean and standard deviation 
+Sampled many samples from this from random normal 
+Compared the quantiles of the projected quantiles for return levels from delta and profile likelihood method 
+We are not saying that the samples generated are examples of other 16 year samples but instead saying that this OBSERVED 16 year sample is valid and follows the GEV!! AND that it double checks this code is working if the delta method and the profile likelihood both get very similar bounds as if we were to have 100000 samples
+
+By the looks of it currently, the 97.5% confidence interval is way too fat and I am not quite sure what to do about this 
+
+# Making weekly data and saving the cases
+```{r Loading data and cleaning}
+
+load("Red_Sea_data.RData")
+
+# per-location monthly mean/sd
+# stored as 12 x n_loc matrices so you can index by [month, location]
+
+n_loc <- ncol(data)          # should be 108
+n_month <- 12
+n_years <- 16
+
+month_mean_all <- matrix(NA, nrow = n_month, ncol = n_loc) # Monthly mean of all locations
+month_sd_all   <- matrix(NA, nrow = n_month, ncol = n_loc) # Monthly sd of all locations 
+annual_max_all <- matrix(NA, nrow = n_years, ncol = n_loc) # Annual max of all locations 
+
+for (i in 1:n_loc) {
+  annual_maxima  <- block_max(data[,i], 365) 
+  
+  for (j in 1:n_years) {
+    annual_max_all[j,i] <- annual_maxima[j]
+  }
+  
+  for (m in 1:n_month) {
+    temps <- data[month == m, i]
+    month_mean_all[m, i] <- mean(temps)
+    month_sd_all[m, i]   <- sd(temps)
+  }
+}
+
+n_samples <- 16*365 # This might be the point of concern at the moment as this is what is makig it not able to run properly I think 
+# Should I switch over to peaks over threshold or maybe probability weighted moments here 
+# OR r largest order?! 
+sets_of_n <- 100
+
+samples_loc <- vector("list", n_loc)
+names(samples_loc) <- paste0("loc", 1:n_loc)
+
+# Here is where should re run the previous chunk in case the rnorm for x_samples was not done for example it was a different one for frechet or weibull or something 
+
+for (i in 1:n_loc) {
+  
+  samples_loc[[i]] <- matrix(NA, nrow = n_samples, ncol = sets_of_n)
+  
+  for (j in 1:sets_of_n) {
+    samples_loc[[i]][, j] <- x_samples(n_samples, month_mean_all[, i], month_sd_all[, i])
+  }
+}
+
+# Now we have a lot of data here which we should double check that the quantiles here for the maximums are within 
+
+sim_bm <- vector("list", n_loc)
+names(sim_bm) <- paste0("loc", 1:n_loc)
+
+for (i in 1:n_loc) {
+  sim_bm[[i]] <- apply(samples_loc[[i]], 2, block_max, block_size = 365)
+}
+
+# Simulated 16x100 annual/block maxima for each location for inspection here 
+# sim_bm[[1]]
+
+save(annual_max_all, month_mean_all, month_sd_all, samples_loc, sim_bm, file = "Red_Sea.RData")
+
+###############################################################################
+
+# FOR THE WEEKLY DATA CLEANING
+
+week_template <- rep(1:52, times = c(rep(7, 51), 8))
+
+week <- rep(week_template, times = length(unique(year)))
+
+n_loc   <- ncol(data)
+n_week  <- 52
+n_years <- length(unique(year))
+
+week_mean_all <- matrix(NA, nrow = n_week, ncol = n_loc)
+week_sd_all   <- matrix(NA, nrow = n_week, ncol = n_loc)
+
+for (i in seq_len(n_loc)) {
+
+  for (w in seq_len(n_week)) {
+    temps <- data[week == w, i]
+    week_mean_all[w, i] <- mean(temps)
+    week_sd_all[w, i]   <- sd(temps)
+  }
+}
+
+save(annual_max_all,week_mean_all,week_sd_all,file = "Red_Sea_weekly.RData")
+
+```
+
+```{r Plot of locations}
+load("Red_Sea_data.RData")
+
+plot(loc)
+
+print(loc[1,])
+
+loc_df <- data.frame(
+  Location = 1:nrow(loc),
+  Longitude = loc[,1],
+  Latitude = loc[,2]
+)
+
+selected <- c(1, 12, 65, 87, 108)
+
+loc_plot <- ggplot(loc_df, aes(Longitude, Latitude)) +
+
+  geom_point(size = 3, colour = "lightblue") +
+  
+  geom_point(
+    data = subset(loc_df, Location %in% selected),
+    colour = "blue",
+    size = 3
+  ) +
+
+  geom_text(
+    data = subset(loc_df, Location %in% selected),
+    aes(label = Location),
+    nudge_y = 0.7,
+    size = 5
+  ) +
+
+  theme_bw() +
+  labs(
+    x = "Longitude",
+    y = "Latitude"
+  )
+
+loc_plot
+
+```
+
+# Notes on loaded data and cleaned data here
+
+samples_loc has all the 100 sets of 16 years of daily data of all 108 locations  
+samples_loc$loc1 gives the 5480 rows daily data and 100 columns for the 100 sets for loc1
+
+sim_bm has 108 locations all of which have 100 sets of 16 simulated years 
+sim_bm$loc1 has 16 rows for the years and 100 columns for the 100 sets 
+
+WHAT DO WE WANT TO DO HERE
+
+The things above are actually not that useful right now 
+annual_max_all gives all the maxes from the observed
+month_mean_all the mean of all respective months 
+month_sd_all the sd of all respective months 
+are more important for us to use in our delta_prof function right now as the mu and sigma
+
+For now because this is like such a fat thing if I was to do this for all 108 locations 
+Just do one and then check how it works with Emma before properly running all 108 
+
+# Comparison figure of the different versions of the step function and which would be better 
+```{r Plotting the graphs for weekly, monthly and the actual observations}
+load("Red_Sea_data.RData")
+load("Red_Sea_weekly.RData")
+load("Red_Sea.RData")
+# plot here as like a small checker
+set.seed(123)
+
+mu <- month_mean_all
+sigma <- month_sd_all
+
+example_month <- x_samples(GEV_samples, mu[,1], sigma[,1])
+
+mu <- week_mean_all
+sigma <- week_sd_all
+
+example_week <- x_samples_weekly(GEV_samples, mu[,1], sigma[,1])
+
+plot(data[1:(5*365),1])
+plot(example_month[1:(5*365)])
+plot(example_week[1:(5*365)])
+
+obs_df <- data.frame(
+  Day = 1:length(data[,1]),
+  Value = data[,1],
+  Series = "Observed"
+)
+
+month_df <- data.frame(
+  Day = 1:length(example_month),
+  Value = example_month,
+  Series = "Monthly"
+)
+
+week_df <- data.frame(
+  Day = 1:length(example_week),
+  Value = example_week,
+  Series = "Weekly"
+)
+
+ggplot(obs_df, aes(Day, Value)) +
+  geom_line() +
+  coord_cartesian(xlim = c(1, 5 * 365)) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+ggplot(month_df, aes(Day, Value)) +
+  geom_line() +
+  coord_cartesian(xlim = c(1, 5 * 365)) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+ggplot(week_df, aes(Day, Value)) +
+  geom_line() +
+  coord_cartesian(xlim = c(1, 5 * 365)) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+plot_df <- rbind(obs_df, month_df, week_df)
+
+month_week <- ggplot(subset(plot_df, Day <= 5 * 365),
+       aes(Day, Value)) +
+  geom_line() +
+  facet_wrap(~Series, ncol = 1) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()+
+  theme(
+  strip.background = element_blank(),
+  strip.text = element_text()
+)
+
+```
+
+# Plotting sliver and computing effective block size 
+```{r Plotting the sliver and computing the effective block size here}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 1
+n_blocks <- 1000                   
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max)    
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)         
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+# To generate the sliver plot and a trimmed number of background plots 
+keep <- sample(n_blocks, 50) 
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.2, size = 1) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 1.8, size = 1.5) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(x = "Day of year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+p_main
+```
+
+```{r location 2}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 2
+n_blocks <- 1000                  
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max) 
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)      
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+# To generate sliver plot and trimmed background
+keep <- sample(n_blocks, 50)
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p2_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.3, size = 0.8) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 1, size = 1) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(title = "Location 2", x = "Day of the year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+```
+
+```{r location 3}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 3
+n_blocks <- 1000                   
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max)   
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)            
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+# To generate sliver plot and trimmed background
+keep <- sample(n_blocks, 50)      
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p3_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.3, size = 0.8) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 1, size = 1) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(title = "Location 3", x = "Day of the year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+```{r location 4}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 4
+n_blocks <- 1000                 
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max)   
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)             # inverse Simpson
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+# To generate sliver plot and trimmed background
+keep <- sample(n_blocks, 50)        
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p4_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.3, size = 0.8) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 1, size = 1) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(title = "Location 4", x = "Day of the year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+```
+
+```{r location 5}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 5
+n_blocks <- 1000               
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max)   
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)            
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+# To generate sliver plot and trimmed background
+keep <- sample(n_blocks, 50)        
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p5_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.3, size = 0.8) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 1, size = 1) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(title = "Location 5", x = "Day of the year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+```
+
+# Combining the plots and figuring out which looks better 
+```{r Combining the plots for the locations above}
+( p2_main | p3_main ) / ( p4_main | p5_main ) 
+
+p2 <- p2_main + labs(x = NULL)            # top-left:     y only
+p3 <- p3_main + labs(x = NULL, y = NULL)  # top-right:    neither
+p4 <- p4_main                             # bottom-left:  both
+p5 <- p5_main + labs(y = NULL)            # bottom-right: x only
+
+combined <- (p2 | p3) / (p4 | p5) +
+  theme_bw() &
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(4, 4, 4, 4),
+  )
+
+combined
+```
+
+
+```{r location 6}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+loc      <- 6
+n_blocks <- 1000                   
+n_days   <- 365
+
+x <- x_samples_weekly(n_blocks * n_days,
+                      week_mean_all[, loc],
+                      week_sd_all[, loc])
+
+X <- matrix(x, nrow = n_days, ncol = n_blocks)
+
+max_day <- apply(X, 2, which.max)   
+max_val <- apply(X, 2, max)
+
+pi_t  <- tabulate(max_day, nbins = n_days) / n_blocks
+n_eff <- 1 / sum(pi_t^2)             # inverse Simpson
+
+cat("Location", loc, ": n_eff =", round(n_eff, 1),
+    "| maxima span days", min(max_day), "to", max(max_day), "\n")
+
+keep <- sample(n_blocks, 50)       
+
+obs_df <- data.frame(
+  day = rep(1:n_days, times = length(keep)),
+  obs = as.vector(X[, keep])
+)
+
+max_df <- data.frame(day = max_day, obs = max_val)
+
+p_main <- ggplot() +
+  geom_point(data = obs_df, aes(day, obs),
+             colour = "lightblue", alpha = 0.5, size = 0.4) +
+  geom_point(data = max_df, aes(day, obs),
+             colour = "black", alpha = 0.4, size = 1.1) +
+  geom_vline(xintercept = range(max_day), linetype = "dashed") +
+  labs(x = "Day of the year", y = "Sea surface temperature (\u00b0C)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+p_hist <- ggplot(max_df, aes(day)) +
+  geom_histogram(binwidth = 7, fill = "grey40") +
+  scale_x_continuous(limits = c(1, n_days)) +
+  labs(x = NULL, y = "Count") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+p_main
+```
+
+# For the fat table for finding effective block size against 
+```{r For all 108 locations effective block size}
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+n_blocks <- 10000
+n_days   <- 365
+n_loc    <- ncol(week_mean_all)
+
+neff_df <- data.frame(
+  location  = 1:n_loc,
+  n_eff     = NA_real_,
+  span_days = NA_integer_,
+  span_min  = NA_integer_,
+  span_max  = NA_integer_,
+  span_95   = NA_integer_
+)
+
+for (i in 1:n_loc) {
+
+  x <- x_samples_weekly(n_blocks * n_days,
+                        week_mean_all[, i],
+                        week_sd_all[, i])
+
+  X       <- matrix(x, nrow = n_days, ncol = n_blocks)
+  max_day <- apply(X, 2, which.max)
+
+  pi_t <- tabulate(max_day, nbins = n_days) / n_blocks
+
+  neff_df$n_eff[i]     <- 1 / sum(pi_t^2)
+  neff_df$span_min[i]  <- min(max_day)
+  neff_df$span_max[i]  <- max(max_day)
+  neff_df$span_days[i] <- max(max_day) - min(max_day) + 1
+
+  # narrowest set of days holding 95% of the maxima
+  ord <- order(pi_t, decreasing = TRUE)
+  neff_df$span_95[i] <- which(cumsum(pi_t[ord]) >= 0.95)[1]
+
+  if (i %% 20 == 0) cat(i, "of", n_loc, "done\n")
+}
+
+neff_df
+
+summary(neff_df$n_eff)
+
+
+plot(neff_df$n_eff, neff_df$span_days)
+```
+
+# Coverage vs effective block size for a singular sample 
+```{r Coverage vs Effective block size}
+cov100 <- red100$Coverage_prof[order(red100$Location)]
+neff   <- neff_df$n_eff
+
+df <- data.frame(location = 1:108, neff = neff, coverage = cov100)
+
+# Red Sea locations with n_eff above the idealised value
+subset(df, neff > 61)
+
+# idealised comparison: S1–S4 at n_eff ~61 gave 0.944–0.953
+
+cov_all <- redsea_all %>%
+  select(Location, ReturnPeriod, Coverage_prof) %>%
+  left_join(neff_df %>% select(Location = location, n_eff), by = "Location")
+
+se <- sqrt(0.93 * 0.07 / 1000)
+
+effvscov <- ggplot(cov_all, aes(n_eff, Coverage_prof)) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  geom_point(alpha = 1, size = 1.5, colour = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  facet_wrap(~ ReturnPeriod,
+             labeller = labeller(ReturnPeriod = function(x) paste0("T = ", x, " years"))) +
+  labs(x = "Effective block size", y = "Coverage") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 10, hjust = 0))
+  
+
+cov_all %>% group_by(ReturnPeriod) %>%
+  summarise(r = cor(n_eff, Coverage_prof), .groups = "drop")
+```
+
+# Initial testing code
+```{r Testing chunk for things that are a little incomplete}
+load("Red_Sea_data.RData")
+load("Red_Sea_weekly.RData")
+###############################################################################
+
+load("Red_Sea.RData")
+
+# Code used to save 
+################################################################################
+GEV_samples <- 16 * 365
+n_samples   <- 10
+q_samples   <- 100000 * 365
+
+mu <- month_mean_all
+sigma <- month_sd_all
+
+################################################################################
+
+# plot here as like a small checker
+set.seed(123)
+example_month <- x_samples(GEV_samples, mu[,1], sigma[,1])
+
+mu <- week_mean_all
+sigma <- week_sd_all
+
+example_week <- x_samples_weekly(GEV_samples, mu[,1], sigma[,1])
+
+plot(data[,1])
+plot(example_month)
+plot(example_week)
+
+plot(data[1:(5*365),1])
+plot(example_month[1:(5*365)])
+plot(example_week[1:(5*365)])
+
+# I would like to move onto doing a weekly mean/sd rather than monthly mean/sd as the generated samples look quite fat 
+# Note that the only thing to change here is the x_samples as that is the only thing contributing to the monthly thing I think
+
+###############################################################################
+
+x_true <- x_samples_weekly(q_samples, week_mean_all, week_sd_all)
+
+bm_true <- block_max(x_true,365)
+
+fit_true <- gev.fit(bm_true)
+
+gev.diag(fit_true)
+
+```
+
+# Learning how to save to a file 
+```{r Test case for one location}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,1]
+sigma <- week_sd_all[,1]
+split <- "weekly"
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+test_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+test_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+test_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(test_redsea_25, 
+     test_redsea_50,
+     test_redsea_100,
+     file = "Test_run_Red_Sea.RData")
+
+
+```
+
+```{r Test_run_Red_Sea}
+load("Test_run_Red_Sea.RData")
+
+test_redsea <- rbind(
+  test_redsea_25$summary, 
+  test_redsea_50$summary,
+  test_redsea_100$summary
+)
+
+test_redsea
+test_redsea_100
+
+plots <- coverage_plots(
+  test_redsea_100$raw, 
+  test_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# Version for location 1 
+```{r Test case 50 years for one location}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,1]
+sigma <- week_sd_all[,1]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+test50_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+test50_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+test50_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(test50_redsea_25, 
+     test50_redsea_50,
+     test50_redsea_100,
+     file = "Test_run50_Red_Sea.RData")
+
+
+```
+
+```{r Test case 50 years Data}
+load("Test_run50_Red_Sea.RData")
+
+test50_redsea <- rbind(
+  test50_redsea_25$summary, 
+  test50_redsea_50$summary,
+  test50_redsea_100$summary
+)
+
+test50_redsea
+
+plots <- coverage_plots(
+  test50_redsea_100$raw, 
+  test50_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+
+
+###############################################################################
+
+estimation_table_prof <- test50_redsea |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of Red Sea location 1.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("table_red_sea_location1.tex")
+
+
+```
+
+# Location 2
+```{r Location 2}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,2]
+sigma <- week_sd_all[,2]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+loc2_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+loc2_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+loc2_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(loc2_redsea_25, 
+     loc2_redsea_50,
+     loc2_redsea_100,
+     file = "loc2_Red_Sea.RData")
+
+
+```
+
+```{r location 2 Data}
+load("loc2_Red_Sea.RData")
+
+loc2_redsea <- rbind(
+  loc2_redsea_25$summary, 
+  loc2_redsea_50$summary,
+  loc2_redsea_100$summary
+)
+
+loc2_redsea
+
+plots <- coverage_plots(
+  loc2_redsea_100$raw, 
+  loc2_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# Location 3 
+```{r Location 3}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,3]
+sigma <- week_sd_all[,3]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+loc3_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+loc3_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+loc3_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(loc3_redsea_25, 
+     loc3_redsea_50,
+     loc3_redsea_100,
+     file = "loc3_Red_Sea.RData")
+
+
+```
+
+```{r location 3 Data}
+load("loc3_Red_Sea.RData")
+
+loc3_redsea <- rbind(
+  loc3_redsea_25$summary, 
+  loc3_redsea_50$summary,
+  loc3_redsea_100$summary
+)
+
+loc3_redsea
+
+plots <- coverage_plots(
+  loc3_redsea_100$raw, 
+  loc3_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# Location 4 
+```{r Location 4}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,4]
+sigma <- week_sd_all[,4]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+loc4_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+loc4_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+loc4_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(loc4_redsea_25, 
+     loc4_redsea_50,
+     loc4_redsea_100,
+     file = "loc4_Red_Sea.RData")
+
+
+```
+
+```{r location 4 Data}
+load("loc4_Red_Sea.RData")
+
+loc4_redsea <- rbind(
+  loc4_redsea_25$summary, 
+  loc4_redsea_50$summary,
+  loc4_redsea_100$summary
+)
+
+loc4_redsea
+
+plots <- coverage_plots(
+  loc4_redsea_100$raw, 
+  loc4_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# Location 5 
+```{r Location 5}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,5]
+sigma <- week_sd_all[,5]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+loc5_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+loc5_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+loc5_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(loc5_redsea_25, 
+     loc5_redsea_50,
+     loc5_redsea_100,
+     file = "loc5_Red_Sea.RData")
+
+
+```
+
+```{r location 5 Data}
+load("loc5_Red_Sea.RData")
+
+loc5_redsea <- rbind(
+  loc5_redsea_25$summary, 
+  loc5_redsea_50$summary,
+  loc5_redsea_100$summary
+)
+
+loc5_redsea
+
+plots <- coverage_plots(
+  loc5_redsea_100$raw, 
+  loc5_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# THE FAT TABLE FOR LOCATIONS 1 to 5 for visualisation in the paper
+```{r Table for first 5 locations}
+
+load("Test_run50_Red_Sea.RData")
+
+test50_redsea <- rbind(
+  test50_redsea_25$summary, 
+  test50_redsea_50$summary,
+  test50_redsea_100$summary
+)
+
+
+load("loc2_Red_Sea.RData")
+
+loc2_redsea <- rbind(
+  loc2_redsea_25$summary, 
+  loc2_redsea_50$summary,
+  loc2_redsea_100$summary
+)
+
+load("loc3_Red_Sea.RData")
+
+loc3_redsea <- rbind(
+  loc3_redsea_25$summary, 
+  loc3_redsea_50$summary,
+  loc3_redsea_100$summary
+)
+
+load("loc4_Red_Sea.RData")
+
+loc4_redsea <- rbind(
+  loc4_redsea_25$summary, 
+  loc4_redsea_50$summary,
+  loc4_redsea_100$summary
+)
+
+
+load("loc5_Red_Sea.RData")
+
+loc5_redsea <- rbind(
+  loc5_redsea_25$summary, 
+  loc5_redsea_50$summary,
+  loc5_redsea_100$summary
+)
+
+
+prepare_table_prof <- function(x, scenario, method){
+  
+  if(method == "Profile"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        prof_rl,
+        RMSE_prof,
+        Bias_prof,
+        Bias_prof_med,
+        Coverage_prof,
+        prof_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = prof_rl,
+        RMSE = RMSE_prof,
+        Bias = Bias_prof,
+        `MD Bias` = Bias_prof_med,
+        Coverage = Coverage_prof,
+        Width = prof_width
+      )
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+prof_all <- rbind(
+  prepare_table_prof(test50_redsea, "RS1", "Profile"),
+  prepare_table_prof(loc2_redsea, "RS2", "Profile"),
+  prepare_table_prof(loc3_redsea, "RS3", "Profile"),
+  prepare_table_prof(loc4_redsea, "RS4", "Profile"),
+  prepare_table_prof(loc5_redsea, "RS5", "Profile")
+)
+
+
+prof_all <- prof_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+prof_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile likelihood return level estimation performance for the weekly-seasonal Red Sea simulation Locations 1 to 5. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("loc12345_RS_table.tex")
+
+
+
+```
+
+# Testing case for a 16 year sample and if we want to use it
+```{r Location 5 16 years}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,5]
+sigma <- week_sd_all[,5]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+loc5_16redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+loc5_16redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+loc5_16redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(loc5_16redsea_25, 
+     loc5_16redsea_50,
+     loc5_16redsea_100,
+     file = "loc5_16Red_Sea.RData")
+
+
+```
+
+```{r location 5 16 years Data}
+load("loc5_16Red_Sea.RData")
+
+loc5_16redsea <- rbind(
+  loc5_16redsea_25$summary, 
+  loc5_16redsea_50$summary,
+  loc5_16redsea_100$summary
+)
+
+loc5_16redsea
+
+plots <- coverage_plots(
+  loc5_16redsea_100$raw, 
+  loc5_16redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+
+# For producing 16 year samples of locations 2 to 4 for comparison with the 50 year case 
+Rather than for all the cases (108)
+```{r Code for location 2:4}
+
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 2:4) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_redsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_16y_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+# Note that I changed this file name to location'i'_Red_Sea.RData
+
+```
+
+# Table of the 16 year samples for location 1 to 5 
+```{r Fat table for 16 years of 1 to 5}
+
+load("Test_run_Red_Sea.RData")
+
+test_redsea <- rbind(
+  test_redsea_25$summary, 
+  test_redsea_50$summary,
+  test_redsea_100$summary
+)
+
+
+load("location2_16y_Red_Sea.RData")
+
+loc2_redsea <- rbind(
+  loc2_redsea_25$summary, 
+  loc2_redsea_50$summary,
+  loc2_redsea_100$summary
+)
+
+load("location3_16y_Red_Sea.RData")
+
+loc3_redsea <- rbind(
+  loc3_redsea_25$summary, 
+  loc3_redsea_50$summary,
+  loc3_redsea_100$summary
+)
+
+load("location4_16y_Red_Sea.RData")
+
+loc4_redsea <- rbind(
+  loc4_redsea_25$summary, 
+  loc4_redsea_50$summary,
+  loc4_redsea_100$summary
+)
+
+
+load("loc5_16Red_Sea.RData")
+
+loc5_16redsea <- rbind(
+  loc5_16redsea_25$summary, 
+  loc5_16redsea_50$summary,
+  loc5_16redsea_100$summary
+)
+
+plots <- coverage_plots(
+  test_redsea_100$raw, 
+  test_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+plots <- coverage_plots(
+  loc2_redsea_100$raw, 
+  loc2_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+plots <- coverage_plots(
+  loc3_redsea_100$raw, 
+  loc3_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+plots <- coverage_plots(
+  loc4_redsea_100$raw, 
+  loc4_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+plots <- coverage_plots(
+  loc5_16redsea_100$raw, 
+  loc5_16redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+
+prepare_table_prof <- function(x, scenario, method){
+  
+  if(method == "Profile"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        prof_rl,
+        RMSE_prof,
+        Bias_prof,
+        Bias_prof_med,
+        Coverage_prof,
+        prof_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = prof_rl,
+        RMSE = RMSE_prof,
+        Bias = Bias_prof,
+        `MD Bias` = Bias_prof_med,
+        Coverage = Coverage_prof,
+        Width = prof_width
+      )
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+prof_all <- rbind(
+  prepare_table_prof(test_redsea, "RS1", "Profile"),
+  prepare_table_prof(loc2_redsea, "RS2", "Profile"),
+  prepare_table_prof(loc3_redsea, "RS3", "Profile"),
+  prepare_table_prof(loc4_redsea, "RS4", "Profile"),
+  prepare_table_prof(loc5_16redsea, "RS5", "Profile")
+)
+
+
+prof_all <- prof_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+prof_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile likelihood return level estimation performance for the weekly-seasonal Red Sea simulation Locations 1 to 5 of 16 year samples. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("loc12345_16y_RS_table.tex")
+
+prof_all
+
+```
+
+# Now trying to make the samples for all 108 to view the comparison
+```{r Code for location 6 to 9}
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 6:9) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_redsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+# Note that I changed this file name to location'i'_Red_Sea.RData
+
+```
+
+```{r Loading Data 6 to 9}
+
+for (i in 6:9) {
+
+  load(paste0("location", i, "_Red_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_redsea_25"))$summary,
+    get(paste0("loc", i, "_redsea_50"))$summary,
+    get(paste0("loc", i, "_redsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_redsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```
+
+# 10 to 20
+```{r Location 10 to 20 }
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 10:20) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_redsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+# Note that I changed this file name to location'i'_Red_Sea.RData
+
+```
+
+```{r Loading Data 10 to 20}
+
+for (i in 10:20) {
+
+  load(paste0("location", i, "_Red_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_redsea_25"))$summary,
+    get(paste0("loc", i, "_redsea_50"))$summary,
+    get(paste0("loc", i, "_redsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_redsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```
+
+# 21 ro 52
+```{r Location 21 to 52 }
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 21:52 ) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_redsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+# Note that I changed this file name to location'i'_Red_Sea.RData
+
+```
+
+```{r Loading Data 21 to 52}
+
+for (i in 21:52) {
+
+  load(paste0("location", i, "_Red_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_redsea_25"))$summary,
+    get(paste0("loc", i, "_redsea_50"))$summary,
+    get(paste0("loc", i, "_redsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_redsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```
+
+# 16 year version of location 21 to 25 for testing purposes
+```{r 16 year Location 21 to 25 }
+
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 24:24) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_16yredsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_16yRed_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+# Note that I changed this file name to location'i'_Red_Sea.RData
+
+```
+
+Location 23 is taking very very very long to converge for the 100 year return level with 16 year samples. 
+Like more than a day has passed and this has not moved even past 20 samples and it has just hung there I believe there is a problem with the optimisation function to do with the evmissing method 
+
+```{r Loading Data 21 to 22}
+
+for (i in 21:22) {
+
+  load(paste0("location", i, "_16yRed_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_16yredsea_25"))$summary,
+    get(paste0("loc", i, "_16yredsea_50"))$summary,
+    get(paste0("loc", i, "_16yredsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_16yredsea"), summary_df)
+  
+  print(summary_df)
+}
+
+```
+
+
+```{r Loading Data 24}
+
+for (i in 24:24) {
+
+  load(paste0("location", i, "_16yRed_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_16yredsea_25"))$summary,
+    get(paste0("loc", i, "_16yredsea_50"))$summary,
+    get(paste0("loc", i, "_16yredsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_16yredsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```
+
+# 50 year method for 100 to 108 
+```{r 50 year Location 100 to 108 }
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 100:108) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_yredsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+```
+
+```{r Loading Data 100 to 108}
+
+for (i in 100:108) {
+
+  load(paste0("location", i, "_Red_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_yredsea_25"))$summary,
+    get(paste0("loc", i, "_yredsea_50"))$summary,
+    get(paste0("loc", i, "_yredsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_redsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```
+
+# 50 year method for 53 to 99 
+Now concludes all 108 locations and we have somehting for everthing
+```{r 50 year Location 53 to 99 }
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+for (loc in 53:99) {
+
+  mu    <- week_mean_all[, loc]
+  sigma <- week_sd_all[, loc]
+
+  object_names <- character()
+
+  for (T in c(25, 50, 100)) {
+    
+    set.seed(123)
+
+    obj_name <- paste0("loc", loc, "_yredsea_", T)
+
+    assign(
+      obj_name,
+      delta_prof_week(
+        GEV_samples,
+        n_samples,
+        q_samples,
+        T,
+        mu,
+        sigma
+      )
+    )
+
+    object_names <- c(object_names, obj_name)
+  }
+
+  save(
+    list = object_names,
+    file = paste0("location", loc, "_Red_Sea.RData")
+  )
+
+  rm(list = object_names)
+
+  cat("Completed location", loc, "of 108\n")
+}
+
+```
+
+```{r Loading Data ALL but 1"5}
+
+for (i in 53:99) {
+
+  load(paste0("location", i, "_Red_Sea.RData"))
+
+  summary_df <- rbind(
+    get(paste0("loc", i, "_yredsea_25"))$summary,
+    get(paste0("loc", i, "_yredsea_50"))$summary,
+    get(paste0("loc", i, "_yredsea_100"))$summary
+  )
+
+  assign(paste0("loc", i, "_redsea"), summary_df)
+  
+  print(summary_df)
+}
+
+
+
+```

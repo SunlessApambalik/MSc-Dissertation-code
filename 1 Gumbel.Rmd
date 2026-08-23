@@ -1,0 +1,1443 @@
+---
+title: "Gumbel Simulations"
+author: '25062476'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ismev) # Coles Package
+library(evmissing) # Simpson & Northrop package 
+library(readr) # for csv and things 
+library(ggplot2)
+library(xtable)
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+```
+
+## This is generally all the code used for Chapter 3 (Simulations)
+Includes several cases that I have tested for the Gumbel domain of attraction using independent samples with monthly means and standard deviations. 
+Idea for this Markdown is to isolate the code so that we will be using some distribution (The Gaussian) that lies in the domain of attraction of Gumbel. 
+
+## Functions required to run the other chunks of this R markdown document 
+```{r Functions for running the rest of this R markdown document}
+x_samples <- function(n_samples, mu, sigma) {
+  month_days  <- c(31,28,31,30,31,30,31,31,30,31,30,31)
+  month_index <- rep(1:12, times = month_days)
+  month_index <- rep(month_index, n_samples/365)
+  rnorm(length(month_index), mean = mu[month_index], sd = sigma[month_index])
+}
+
+block_max <- function(x, block_size) {
+  as.numeric(tapply(x, (seq_along(x) - 1) %/% block_size, max))
+}
+
+delta_rl_CI <- function(T, fit) {
+  mu    <- fit$mle[1]
+  sigma <- fit$mle[2]
+  xi    <- fit$mle[3]
+  V     <- fit$cov
+  y     <- -log(1 - 1/T)
+
+  if (abs(xi) < 1e-6) {
+    rl     <- mu - sigma * log(y)
+    var_rl <- V[1,1] + (log(y))^2 * V[2,2] - 2 * log(y) * V[1,2]
+  } else {
+    rl      <- mu + (sigma/xi) * (y^(-xi) - 1)
+    grad_rl <- c(1, (y^(-xi) - 1)/xi, sigma * (1 - y^(-xi) - xi * y^(-xi) * log(y))/xi^2)
+    var_rl  <- as.numeric(t(grad_rl) %*% V %*% grad_rl)
+  }
+
+  se_rl <- sqrt(var_rl)
+  data.frame(ReturnLevel = rl, Lower = rl - 1.96 * se_rl, Upper = rl + 1.96 * se_rl)
+}
+
+delta_prof <- function(GEV_samples, n_samples, q_samples, T, mu, sigma) {
+
+  # True return level from large sample (OR REFERENCE RETURN LEVELS) more correct! 
+  x_true  <- x_samples(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+
+  cat("True return level (T =", T, "):", round(true_rl, 4), "\n")
+
+  results <- data.frame(
+    delta_rl    = numeric(n_samples),
+    delta_lower = numeric(n_samples),
+    delta_upper = numeric(n_samples),
+    prof_rl     = numeric(n_samples),
+    prof_lower  = numeric(n_samples),
+    prof_upper  = numeric(n_samples)
+  )
+
+  delta_fail     <- 0L
+  profile_fail   <- 0L
+  profileci_fail <- 0L
+
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+
+    x_dummy  <- x_samples(GEV_samples, mu, sigma)
+    bm_dummy <- block_max(x_dummy, 365)
+
+    # Delta method
+    fit_delta <- tryCatch(
+      suppressWarnings(gev.fit(bm_dummy, show = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_delta)) {
+      delta_fail <- delta_fail + 1L
+      results[i, c("delta_rl", "delta_lower", "delta_upper")] <- NA
+    } else {
+      ci <- delta_rl_CI(T, fit_delta)
+      results[i, "delta_rl"]    <- ci$ReturnLevel
+      results[i, "delta_lower"] <- ci$Lower
+      results[i, "delta_upper"] <- ci$Upper
+    }
+
+    # Profile likelihood
+    fit_prof <- tryCatch(
+      suppressWarnings(gev_mle(bm_dummy, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+    } else {
+      prof_return <- gev_return(fit_prof, m = T)
+      prof_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+      } else {
+        results[i, "prof_rl"]    <- as.numeric(prof_return)
+        results[i, "prof_lower"] <- prof_conf[1, 1]
+        results[i, "prof_upper"] <- prof_conf[1, 2]
+      }
+    }
+  }
+
+  # Summary dataframe to collect all the info I needed 
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+
+    delta_rl   = mean(results$delta_rl,  na.rm = TRUE),
+    prof_rl    = mean(results$prof_rl,   na.rm = TRUE),
+
+    RMSE_delta = sqrt(mean((results$delta_rl - true_rl)^2, na.rm = TRUE)),
+    RMSE_prof  = sqrt(mean((results$prof_rl  - true_rl)^2, na.rm = TRUE)),
+
+    Bias_delta     = mean(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof      = mean(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Bias_delta_med = median(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof_med  = median(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Coverage_delta = mean(results$delta_lower <= true_rl &
+                          results$delta_upper >= true_rl, na.rm = TRUE),
+    Coverage_prof  = mean(results$prof_lower  <= true_rl &
+                          results$prof_upper  >= true_rl, na.rm = TRUE),
+    
+    delta_width    = mean(results$delta_upper - results$delta_lower, na.rm=TRUE),
+    prof_width     = mean(results$prof_upper - results$prof_lower, na.rm=TRUE)
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,       
+    true_rl            = true_rl,
+    delta_failures     = delta_fail,
+    profile_failures   = profile_fail,
+    profileci_failures = profileci_fail,
+    delta_failure_rate   = delta_fail     / n_samples,
+    profile_failure_rate = profile_fail   / n_samples
+  )
+}
+
+coverage_plots <- function(raw, true_rl) {
+  
+  raw     <- raw
+  true_rl <- true_rl
+  
+  n <- nrow(raw)
+  raw$iteration <- seq_len(n)
+  
+  raw$delta_covers <- raw$delta_lower <= true_rl & raw$delta_upper >= true_rl
+  raw$prof_covers  <- raw$prof_lower  <= true_rl & raw$prof_upper  >= true_rl
+  
+  # ── Delta plot ────────────────────────────────────────────────────────────────
+  p_delta <- ggplot(raw, aes(x = iteration, colour = delta_covers)) +
+  
+    geom_linerange(aes(ymin = delta_lower, ymax = delta_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = delta_rl), shape = 16, size = 1.5, alpha = 0.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", hjust = 0.5),
+      legend.position  = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin    = margin(4, 6, 4, 6)
+    )
+  
+  # ── Profile plot ──────────────────────────────────────────────────────────────
+  p_prof <- ggplot(raw, aes(x = iteration, colour = prof_covers)) +
+  
+    geom_linerange(aes(ymin = prof_lower, ymax = prof_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = prof_rl), shape = 16, size = 1.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor  = element_blank(),
+      plot.title        = element_text(face = "bold", hjust = 0.5),
+      legend.position   = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin     = margin(4, 6, 4, 6)
+    )
+  
+  list(
+    delta   = p_delta,
+    profile = p_prof
+  )
+}
+
+```
+
+## No seasonality run
+```{r no seasonality case, eval=FALSE}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- rep(0, 12)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+nseg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+noseasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+noseasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+noseasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(noseasonality25_gumbel, 
+     noseasonality50_gumbel, 
+     noseasonality100_gumbel,  
+     nseg_gumbel,
+     file = "no_seasonality_gumbel.RData")
+
+```
+
+```{r No seasonality Data}
+load("no_seasonality_gumbel.RData")
+
+noseasonality_gumbel <- rbind(
+  noseasonality25_gumbel$summary,
+  noseasonality50_gumbel$summary,
+  noseasonality100_gumbel$summary
+)
+
+noseasonality_gumbel
+plot(nseg_gumbel[1:(5*365)])
+nsbm_gumbel <- block_max(nseg_gumbel, 365)
+nsfit_gumbel <- gev.fit(nsbm_gumbel)
+gev.diag(nsfit_gumbel)
+
+nspfit_gumbel <- gev_mle(nsbm_gumbel,1)
+plot(nspfit_gumbel, profile = TRUE)
+
+plots <- coverage_plots(
+  noseasonality100_gumbel$raw, 
+  noseasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+
+```{r no seasonality for latex}
+load("no_seasonality_gumbel.RData")
+
+noseasonality_gumbel <- rbind(
+  noseasonality25_gumbel$summary,
+  noseasonality50_gumbel$summary,
+  noseasonality100_gumbel$summary
+)
+
+################################################################################
+
+estimation_table_delta <- noseasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    delta_rl,
+    RMSE_delta,
+    Bias_delta,
+    Bias_delta_med,
+    Coverage_delta,
+    delta_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Delta RL" = delta_rl,
+    "RMSE" = RMSE_delta,
+    "Bias" = Bias_delta,
+    "MD Bias" = Bias_delta_med,
+    "Coverage" = Coverage_delta,
+    "Width" = delta_width
+    
+  )
+
+estimation_table_delta <- estimation_table_delta |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_delta |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta Return level estimation performance of no seasonality Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("noseasonality_gumbel_delta_rl.tex")
+
+###############################################################################
+
+estimation_table_prof <- noseasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of no seasonality Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("noseasonality_gumbel_prof_rl.tex")
+
+```
+
+## S1 in paper and how to save the table of results
+```{r version 1 seasonal case}
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v1seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v1seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v1seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v1seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v1seasonality25_gumbel, 
+     v1seasonality50_gumbel, 
+     v1seasonality100_gumbel,  
+     v1seg_gumbel,
+     file = "v1_seasonality_gumbel.RData")
+```
+
+```{r Plots and v1 seasonal Data}
+load("v1_seasonality_gumbel.RData")
+
+#v1seasonality25_gumbel
+#v1seasonality50_gumbel
+#v1seasonality100_gumbel
+
+v1seasonality_gumbel <- rbind(
+  v1seasonality25_gumbel$summary,
+  v1seasonality50_gumbel$summary,
+  v1seasonality100_gumbel$summary
+)
+
+v1seasonality_gumbel
+plot(v1seg_gumbel[1:(5*365)])
+v1sbm_gumbel <- block_max(v1seg_gumbel, 365)
+v1sfit_gumbel <- gev.fit(v1sbm_gumbel)
+gev.diag(v1sfit_gumbel)
+
+plots <- coverage_plots(
+  v1seasonality100_gumbel$raw, 
+  v1seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+v1seasonality_gumbel
+
+
+
+```
+
+```{r Saving the table of results in latex}
+load("v1_seasonality_gumbel.RData")
+
+v1seasonality_gumbel <- rbind(
+  v1seasonality25_gumbel$summary,
+  v1seasonality50_gumbel$summary,
+  v1seasonality100_gumbel$summary
+)
+
+
+################################################################################
+
+estimation_table_delta <- v1seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    delta_rl,
+    RMSE_delta,
+    Bias_delta,
+    Bias_delta_med,
+    Coverage_delta,
+    delta_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Delta RL" = delta_rl,
+    "RMSE" = RMSE_delta,
+    "Bias" = Bias_delta,
+    "MD Bias" = Bias_delta_med,
+    "Coverage" = Coverage_delta,
+    "Width" = delta_width
+    
+  )
+
+estimation_table_delta <- estimation_table_delta |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_delta |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta Return level estimation performance of seasonality version 1 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v1seasonality_gumbel_delta_rl.tex")
+
+###############################################################################
+
+estimation_table_prof <- v1seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of seasonality version 1 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v1seasonality_gumbel_prof_rl.tex")
+```
+
+## S2 in paper and how to save the table of results
+```{r version 2 seasonal case}
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,4,8,13,20,20,13,8,4,2,1)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v2seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v2seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v2seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v2seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v2seasonality25_gumbel, 
+     v2seasonality50_gumbel, 
+     v2seasonality100_gumbel,  
+     v2seg_gumbel,
+     file = "v2_seasonality_gumbel.RData")
+```
+
+```{r V2 Seasonality Data}
+load("v2_seasonality_gumbel.RData")
+
+#v2seasonality25_gumbel
+#v2seasonality50_gumbel
+#v2seasonality100_gumbel
+
+v2seasonality_gumbel <- rbind(
+  v2seasonality25_gumbel$summary,
+  v2seasonality50_gumbel$summary,
+  v2seasonality100_gumbel$summary
+)
+
+v2seasonality_gumbel
+plot(v2seg_gumbel[1:(5*365)])
+v2sbm_gumbel <- block_max(v2seg_gumbel, 365)
+v2sfit_gumbel <- gev.fit(v2sbm_gumbel)
+gev.diag(v2sfit_gumbel)
+
+plots <- coverage_plots(
+  v2seasonality100_gumbel$raw, 
+  v2seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+```{r Saving the table of results in latex}
+load("v2_seasonality_gumbel.RData")
+
+v2seasonality_gumbel <- rbind(
+  v2seasonality25_gumbel$summary,
+  v2seasonality50_gumbel$summary,
+  v2seasonality100_gumbel$summary
+)
+
+################################################################################
+
+estimation_table_delta <- v2seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    delta_rl,
+    RMSE_delta,
+    Bias_delta,
+    Bias_delta_med,
+    Coverage_delta,
+    delta_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Delta RL" = delta_rl,
+    "RMSE" = RMSE_delta,
+    "Bias" = Bias_delta,
+    "MD Bias" = Bias_delta_med,
+    "Coverage" = Coverage_delta,
+    "Width" = delta_width
+    
+  )
+
+estimation_table_delta <- estimation_table_delta |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_delta |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta Return level estimation performance of seasonality version 2 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v2seasonality_gumbel_delta_rl.tex")
+
+
+
+###############################################################################
+
+estimation_table_prof <- v2seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of seasonality version 2 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v2seasonality_gumbel_prof_rl.tex")
+
+
+```
+
+## S4 in paper and how to save the table of results
+WARNING: I realised later that I did not include an isolated case of keeping mean constant while standard deviation is varied so this is put to S4 and the other is S3
+```{r version 3 seasonal case}
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+sigma       <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v3seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v3seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v3seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v3seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v3seasonality25_gumbel, 
+     v3seasonality50_gumbel, 
+     v3seasonality100_gumbel,  
+     v3seg_gumbel,
+     file = "v3_seasonality_gumbel.RData")
+```
+
+```{r V3 Seasonality Data}
+load("v3_seasonality_gumbel.RData")
+
+#v3seasonality25_gumbel
+#v3seasonality50_gumbel
+#v3seasonality100_gumbel
+
+v3seasonality_gumbel <- rbind(
+  v3seasonality25_gumbel$summary,
+  v3seasonality50_gumbel$summary,
+  v3seasonality100_gumbel$summary
+)
+
+v3seasonality_gumbel
+plot(v3seg_gumbel[1:(5*365)])
+v3sbm_gumbel <- block_max(v3seg_gumbel, 365)
+v3sfit_gumbel <- gev.fit(v3sbm_gumbel)
+gev.diag(v3sfit_gumbel)
+
+plots <- coverage_plots(
+  v3seasonality100_gumbel$raw, 
+  v3seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+```{r Saving the table of results in latex}
+load("v3_seasonality_gumbel.RData")
+
+v3seasonality_gumbel <- rbind(
+  v3seasonality25_gumbel$summary,
+  v3seasonality50_gumbel$summary,
+  v3seasonality100_gumbel$summary
+)
+
+################################################################################
+
+estimation_table_delta <- v3seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    delta_rl,
+    RMSE_delta,
+    Bias_delta,
+    Bias_delta_med,
+    Coverage_delta,
+    delta_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Delta RL" = delta_rl,
+    "RMSE" = RMSE_delta,
+    "Bias" = Bias_delta,
+    "MD Bias" = Bias_delta_med,
+    "Coverage" = Coverage_delta,
+    "Width" = delta_width
+    
+  )
+
+estimation_table_delta <- estimation_table_delta |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_delta |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta Return level estimation performance of seasonality version 3 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v3seasonality_gumbel_delta_rl.tex")
+
+###############################################################################
+
+estimation_table_prof <- v3seasonality_gumbel |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of seasonality version 3 Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("v3seasonality_gumbel_prof_rl.tex")
+
+
+```
+
+# FAT TABLE HERE THAT IS GOING TO BE COMBINED FOR THE LATEX CODE 
+```{r Combination of the tables to make one fat one that looks better}
+
+load("no_seasonality_gumbel.RData")
+
+noseasonality_gumbel <- rbind(
+  noseasonality25_gumbel$summary,
+  noseasonality50_gumbel$summary,
+  noseasonality100_gumbel$summary
+)
+
+load("v1_seasonality_gumbel.RData")
+
+v1seasonality_gumbel <- rbind(
+  v1seasonality25_gumbel$summary,
+  v1seasonality50_gumbel$summary,
+  v1seasonality100_gumbel$summary
+)
+
+load("v2_seasonality_gumbel.RData")
+
+v2seasonality_gumbel <- rbind(
+  v2seasonality25_gumbel$summary,
+  v2seasonality50_gumbel$summary,
+  v2seasonality100_gumbel$summary
+)
+
+load("v3_seasonality_gumbel.RData")
+
+v3seasonality_gumbel <- rbind(
+  v3seasonality25_gumbel$summary,
+  v3seasonality50_gumbel$summary,
+  v3seasonality100_gumbel$summary
+)
+
+# Flip this and v3 as I need v4 to be the important one as well
+
+load("v4_seasonality_gumbel.RData")
+
+v4seasonality_gumbel <- rbind(
+  v4seasonality25_gumbel$summary,
+  v4seasonality50_gumbel$summary,
+  v4seasonality100_gumbel$summary
+)
+
+prepare_table_delta <- function(x, scenario, method){
+  
+  if(method == "Delta"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        delta_rl,
+        RMSE_delta,
+        Bias_delta,
+        Bias_delta_med,
+        Coverage_delta,
+        delta_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = delta_rl,
+        RMSE = RMSE_delta,
+        Bias = Bias_delta,
+        `MD Bias` = Bias_delta_med,
+        Coverage = Coverage_delta,
+        Width = delta_width
+      )
+    
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+
+prepare_table_prof <- function(x, scenario, method){
+  
+  if(method == "Profile"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        prof_rl,
+        RMSE_prof,
+        Bias_prof,
+        Bias_prof_med,
+        Coverage_prof,
+        prof_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = prof_rl,
+        RMSE = RMSE_prof,
+        Bias = Bias_prof,
+        `MD Bias` = Bias_prof_med,
+        Coverage = Coverage_prof,
+        Width = prof_width
+      )
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+delta_all <- rbind(
+  prepare_table_delta(noseasonality_gumbel, "NS", "Delta"),
+  prepare_table_delta(v1seasonality_gumbel, "S1", "Delta"),
+  prepare_table_delta(v2seasonality_gumbel, "S2", "Delta"),
+  prepare_table_delta(v4seasonality_gumbel, "S3", "Delta"),
+  prepare_table_delta(v3seasonality_gumbel, "S4", "Delta")
+)
+
+prof_all <- rbind(
+  prepare_table_prof(noseasonality_gumbel, "NS", "Profile"),
+  prepare_table_prof(v1seasonality_gumbel, "S1", "Profile"),
+  prepare_table_prof(v2seasonality_gumbel, "S2", "Profile"),
+  prepare_table_prof(v4seasonality_gumbel, "S3", "Profile"),
+  prepare_table_prof(v3seasonality_gumbel, "S4", "Profile")
+)
+
+delta_all <- delta_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+prof_all <- prof_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+
+delta_all
+prof_all
+
+
+delta_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta method for Return level estimation performance for Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("all_seasonality_gumbel_delta.tex")
+
+prof_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood method for Return level estimation performance for Gumbel.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("all_seasonality_gumbel_prof.tex")
+
+
+
+
+
+```
+
+# Standardised Fat table when I realised that I cannot just compare the values like that 
+```{r Gumbel Standardised table}
+
+load("no_seasonality_gumbel.RData")
+
+noseasonality_gumbel <- rbind(
+  noseasonality25_gumbel$summary,
+  noseasonality50_gumbel$summary,
+  noseasonality100_gumbel$summary
+)
+
+load("v1_seasonality_gumbel.RData")
+
+v1seasonality_gumbel <- rbind(
+  v1seasonality25_gumbel$summary,
+  v1seasonality50_gumbel$summary,
+  v1seasonality100_gumbel$summary
+)
+
+load("v2_seasonality_gumbel.RData")
+
+v2seasonality_gumbel <- rbind(
+  v2seasonality25_gumbel$summary,
+  v2seasonality50_gumbel$summary,
+  v2seasonality100_gumbel$summary
+)
+
+load("v3_seasonality_gumbel.RData")
+
+v3seasonality_gumbel <- rbind(
+  v3seasonality25_gumbel$summary,
+  v3seasonality50_gumbel$summary,
+  v3seasonality100_gumbel$summary
+)
+
+# Flip this and v3 as I need v4 to be the important one as well
+
+load("v4_seasonality_gumbel.RData")
+
+v4seasonality_gumbel <- rbind(
+  v4seasonality25_gumbel$summary,
+  v4seasonality50_gumbel$summary,
+  v4seasonality100_gumbel$summary
+)
+
+
+LS_gumbel <- tibble::tribble(
+  ~Scenario, ~L, ~S,
+  "NS",       0,  1,
+  "S1",       6,  1,
+  "S2",      20,  1,
+  "S3",       0,  6,
+  "S4",       6,  6
+)
+
+prepare_combined <- function(x, scenario) {
+  x |>
+    select(
+      ReturnPeriod,
+      true_rl,
+      prof_rl, delta_rl,
+      RMSE_prof, RMSE_delta,
+      Bias_prof, Bias_prof_med,
+      Coverage_delta, delta_width,
+      Coverage_prof,  prof_width
+    ) |>
+    mutate(Scenario = scenario, .before = 1)
+}
+
+combined_raw <- rbind(
+  prepare_combined(noseasonality_gumbel, "NS"),
+  prepare_combined(v1seasonality_gumbel, "S1"),
+  prepare_combined(v2seasonality_gumbel, "S2"),
+  prepare_combined(v4seasonality_gumbel, "S3"),   # v4 -> S3
+  prepare_combined(v3seasonality_gumbel, "S4")    # v3 -> S4
+)
+
+# lil checker incase the point estimates dont line up 
+max_diff <- max(abs(combined_raw$prof_rl   - combined_raw$delta_rl),
+                abs(combined_raw$RMSE_prof - combined_raw$RMSE_delta))
+if (max_diff > 5e-4) {
+  warning("Delta and profile point estimates differ by up to ",
+          round(max_diff, 4),
+          ". Table reports the profile values only -- check before submitting.")
+}
+
+build_gumbel_table <- function(dat, LS, standardise = TRUE) {
+
+  dat |>
+    left_join(LS, by = "Scenario") |>
+    mutate(
+      shift = if (standardise) L else 0,
+      scale = if (standardise) S else 1
+    ) |>
+    transmute(
+      Scenario,
+      T        = ReturnPeriod,
+      Ref      = (true_rl - shift) / scale,
+      Est      = (prof_rl - shift) / scale,
+      RMSE     = RMSE_prof     / scale,
+      Bias     = Bias_prof     / scale,
+      `M Bias` = Bias_prof_med / scale,
+      DCovers  = Coverage_delta,
+      DWidth   = delta_width   / scale,
+      PCovers  = Coverage_prof,
+      PWidth   = prof_width    / scale
+    )
+}
+
+print_gumbel_table <- function(tab, caption, label, file,
+                               digits = 3,
+                               digits_by_col = NULL) {
+
+  num_cols <- names(tab)[vapply(tab, is.numeric, logical(1))]
+  num_cols <- setdiff(num_cols, "T")
+
+  dg <- setNames(rep(digits, length(num_cols)), num_cols)
+  if (!is.null(digits_by_col)) {
+    dg[names(digits_by_col)] <- digits_by_col
+  }
+
+  chr <- tab
+  for (nm in num_cols) {
+    chr[[nm]] <- sprintf(paste0("%.", dg[[nm]], "f"), chr[[nm]])
+  }
+  chr$T <- as.character(chr$T)
+
+  chr$Scenario[duplicated(chr$Scenario)] <- ""
+
+  grp <- "& & \\multicolumn{2}{c}{Return Level} & \\multicolumn{3}{c}{Error} & \\multicolumn{2}{c}{Delta} & \\multicolumn{2}{c}{Profile} \\\\"
+  mid <- "\\cmidrule(lr){3-4} \\cmidrule(lr){5-7} \\cmidrule(lr){8-9} \\cmidrule(lr){10-11}"
+  nms <- "Scenario & T & Ref & Est & RMSE & Bias & M Bias & Covers & Width & Covers & Width \\\\"
+
+  header <- paste("\\toprule", grp, mid, nms, "\\midrule", sep = "\n")
+
+  n_per  <- 3L
+  breaks <- seq(n_per, nrow(chr) - n_per, by = n_per)
+
+  addtorow <- list(
+    pos     = c(list(-1), as.list(breaks), list(nrow(chr))),
+    command = c(header, rep("\\midrule\n", length(breaks)), "\\bottomrule\n")
+  )
+
+  xt <- xtable(chr,
+               caption = caption,
+               label   = label,
+               align   = paste0("ll", strrep("r", ncol(chr) - 1)))
+
+  print(xt,
+        file              = file,
+        include.rownames  = FALSE,
+        include.colnames  = FALSE,
+        hline.after       = NULL,
+        add.to.row        = addtorow,
+        booktabs          = TRUE,
+        caption.placement = "top",
+        sanitize.text.function = identity,
+        table.placement   = "ht")
+}
+
+std_table <- build_gumbel_table(combined_raw, LS_gumbel, standardise = TRUE)
+
+print_gumbel_table(
+  std_table,
+  caption = "...",
+  label   = "tab:gumbel_standardised",
+  file    = "gumbel_standardised.tex",
+  digits  = 3,
+  digits_by_col = c(Ref = 3, Est = 3, DCovers = 3, PCovers = 3)
+)
+
+std_table
+
+```
+
+# Attempt at generating boxplots for xi here what can I do? 
+```{r Generating boxplots for xi}
+
+load("no_seasonality_gumbel.RData")
+
+noseasonality_gumbel <- rbind(
+  noseasonality25_gumbel$summary,
+  noseasonality50_gumbel$summary,
+  noseasonality100_gumbel$summary
+)
+
+load("v1_seasonality_gumbel.RData")
+
+v1seasonality_gumbel <- rbind(
+  v1seasonality25_gumbel$summary,
+  v1seasonality50_gumbel$summary,
+  v1seasonality100_gumbel$summary
+)
+
+load("v2_seasonality_gumbel.RData")
+
+v2seasonality_gumbel <- rbind(
+  v2seasonality25_gumbel$summary,
+  v2seasonality50_gumbel$summary,
+  v2seasonality100_gumbel$summary
+)
+
+load("v3_seasonality_gumbel.RData")
+
+v3seasonality_gumbel <- rbind(
+  v3seasonality25_gumbel$summary,
+  v3seasonality50_gumbel$summary,
+  v3seasonality100_gumbel$summary
+)
+
+# Flip this and v3 as I need v4 to be the important one as well
+
+load("v4_seasonality_gumbel.RData")
+
+v4seasonality_gumbel <- rbind(
+  v4seasonality25_gumbel$summary,
+  v4seasonality50_gumbel$summary,
+  v4seasonality100_gumbel$summary
+)
+
+noseasonality100_gumbel$
+```
+
+# Version for S3 test case
+```{r version 4 seasonal case}
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- rep(0,12)
+sigma       <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v4seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v4seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v4seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v4seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v4seasonality25_gumbel, 
+     v4seasonality50_gumbel, 
+     v4seasonality100_gumbel,  
+     v4seg_gumbel,
+     file = "v4_seasonality_gumbel.RData")
+```
+
+```{r V4 Seasonality Data}
+load("v4_seasonality_gumbel.RData")
+
+#v3seasonality25_gumbel
+#v3seasonality50_gumbel
+#v3seasonality100_gumbel
+
+v4seasonality_gumbel <- rbind(
+  v4seasonality25_gumbel$summary,
+  v4seasonality50_gumbel$summary,
+  v4seasonality100_gumbel$summary
+)
+
+v4seasonality_gumbel
+plot(v4seg_gumbel[1:(5*365)])
+v4sbm_gumbel <- block_max(v4seg_gumbel, 365)
+v4sfit_gumbel <- gev.fit(v4sbm_gumbel)
+gev.diag(v4sfit_gumbel)
+
+plots <- coverage_plots(
+  v4seasonality100_gumbel$raw, 
+  v4seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# 16 year case comparison
+```{r V4 Thinner seasonality}
+
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- rep(0, 12)
+sigma       <- rep(1,12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v4seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v4seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v4seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v4seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v4seasonality25_gumbel, 
+     v4seasonality50_gumbel, 
+     v4seasonality100_gumbel,  
+     v4seg_gumbel,
+     file = "v4_seasonality_gumbel.RData")
+```
+
+```{r V4 seasonality Data}
+
+load("v4_seasonality_gumbel.RData")
+
+v4seasonality_gumbel <- rbind(
+  v4seasonality25_gumbel$summary,
+  v4seasonality50_gumbel$summary,
+  v4seasonality100_gumbel$summary
+)
+
+v4seasonality100_gumbel
+v4seasonality_gumbel
+plot(v4seg_gumbel[1:(5*365)])
+v4sbm_gumbel <- block_max(v4seg_gumbel, 365)
+v4sfit_gumbel <- gev.fit(v4sbm_gumbel)
+gev.diag(v4sfit_gumbel)
+
+plots <- coverage_plots(
+  v4seasonality100_gumbel$raw, 
+  v4seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+  
+```
+
+# Test case for another seasonality version which I should look into 
+```{r V5 Seasonal implementation}
+GEV_samples <- 16 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+sigma       <- rep(1,12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v5seg_gumbel <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v5seasonality25_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v5seasonality50_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v5seasonality100_gumbel <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v5seasonality25_gumbel, 
+     v5seasonality50_gumbel, 
+     v5seasonality100_gumbel,  
+     v5seg_gumbel,
+     file = "v5_seasonality_gumbel.RData")
+```
+Note that I think the 48th row one is the absolutely disgustingly big return level for some reason 
+Could look to remove this point 
+
+```{r V5 Seasonal Data}
+load("v5_seasonality_gumbel.RData")
+
+v5seasonality_gumbel <- rbind(
+  v5seasonality25_gumbel$summary,
+  v5seasonality50_gumbel$summary,
+  v5seasonality100_gumbel$summary
+)
+
+v5seasonality_gumbel
+plot(v5seg_gumbel[1:(5*365)])
+v5sbm_gumbel <- block_max(v5seg_gumbel, 365)
+v5sfit_gumbel <- gev.fit(v5sbm_gumbel)
+gev.diag(v5sfit_gumbel)
+
+v5seasonality100_gumbel
+
+plots <- coverage_plots(
+  v5seasonality100_gumbel$raw, 
+  v5seasonality100_gumbel$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+
+```
+
+
+
+

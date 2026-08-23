@@ -1,0 +1,1098 @@
+---
+title: "Frechet Simulations"
+author: '25062476'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ismev) # Coles Package
+library(evmissing) # Simpson & Northrop package 
+library(readr) # for csv and things 
+library(ggplot2)
+
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+```
+
+# This is generally used for Chapter 3 / Appendix for the Frechet domain
+Same idea as the Gumbel case
+
+```{r Frechet big function}
+x_samples <- function(n_samples, mu, sigma, df = 10) {
+
+  month_days <- c(31,28,31,30,31,30,31,31,30,31,30,31)
+
+  month_index <- rep(1:12, times = month_days)
+  month_index <- rep(month_index, n_samples / 365)
+
+  mu[month_index] +
+    sigma[month_index] * rt(length(month_index), df = df)
+}
+
+df <- 10
+
+block_max <- function(x, block_size) {
+  as.numeric(tapply(x, (seq_along(x) - 1) %/% block_size, max))
+}
+
+delta_rl_CI <- function(T, fit) {
+  mu    <- fit$mle[1]
+  sigma <- fit$mle[2]
+  xi    <- fit$mle[3]
+  V     <- fit$cov
+  y     <- -log(1 - 1/T)
+
+  if (abs(xi) < 1e-6) {
+    rl     <- mu - sigma * log(y)
+    var_rl <- V[1,1] + (log(y))^2 * V[2,2] - 2 * log(y) * V[1,2]
+  } else {
+    rl      <- mu + (sigma/xi) * (y^(-xi) - 1)
+    grad_rl <- c(1, (y^(-xi) - 1)/xi, sigma * (1 - y^(-xi) - xi * y^(-xi) * log(y))/xi^2)
+    var_rl  <- as.numeric(t(grad_rl) %*% V %*% grad_rl)
+  }
+
+  se_rl <- sqrt(var_rl)
+  data.frame(ReturnLevel = rl, Lower = rl - 1.96 * se_rl, Upper = rl + 1.96 * se_rl)
+}
+
+delta_prof <- function(GEV_samples, n_samples, q_samples, T, mu, sigma) {
+
+  # True return level from large sample
+  x_true  <- x_samples(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+
+  cat("True return level (T =", T, "):", round(true_rl, 4), "\n")
+  
+  results <- data.frame(
+    delta_rl    = numeric(n_samples),
+    delta_lower = numeric(n_samples),
+    delta_upper = numeric(n_samples),
+    prof_rl     = numeric(n_samples),
+    prof_lower  = numeric(n_samples),
+    prof_upper  = numeric(n_samples)
+  )
+
+  delta_fail     <- 0L
+  profile_fail   <- 0L
+  profileci_fail <- 0L
+
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+
+    x_dummy  <- x_samples(GEV_samples, mu, sigma)
+    bm_dummy <- block_max(x_dummy, 365)
+
+    # Delta method
+    fit_delta <- tryCatch(
+      suppressWarnings(gev.fit(bm_dummy, show = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_delta)) {
+      delta_fail <- delta_fail + 1L
+      results[i, c("delta_rl", "delta_lower", "delta_upper")] <- NA
+    } else {
+      ci <- delta_rl_CI(T, fit_delta)
+      results[i, "delta_rl"]    <- ci$ReturnLevel
+      results[i, "delta_lower"] <- ci$Lower
+      results[i, "delta_upper"] <- ci$Upper
+    }
+
+    # Profile likelihood
+    fit_prof <- tryCatch(
+      suppressWarnings(gev_mle(bm_dummy, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+    } else {
+      prof_return <- gev_return(fit_prof, m = T)
+      prof_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+      } else {
+        results[i, "prof_rl"]    <- as.numeric(prof_return)
+        results[i, "prof_lower"] <- prof_conf[1, 1]
+        results[i, "prof_upper"] <- prof_conf[1, 2]
+      }
+    }
+  }
+
+  # Summary
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+
+    delta_rl   = mean(results$delta_rl,  na.rm = TRUE),
+    prof_rl    = mean(results$prof_rl,   na.rm = TRUE),
+
+    RMSE_delta = sqrt(mean((results$delta_rl - true_rl)^2, na.rm = TRUE)),
+    RMSE_prof  = sqrt(mean((results$prof_rl  - true_rl)^2, na.rm = TRUE)),
+
+    Bias_delta     = mean(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof      = mean(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Bias_delta_med = median(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof_med  = median(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Coverage_delta = mean(results$delta_lower <= true_rl &
+                          results$delta_upper >= true_rl, na.rm = TRUE),
+    Coverage_prof  = mean(results$prof_lower  <= true_rl &
+                          results$prof_upper  >= true_rl, na.rm = TRUE),
+    
+    delta_width    = mean(results$delta_upper - results$delta_lower, na.rm=TRUE),
+    prof_width     = mean(results$prof_upper - results$prof_lower, na.rm=TRUE)
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,        
+    true_rl            = true_rl,
+    delta_failures     = delta_fail,
+    profile_failures   = profile_fail,
+    profileci_failures = profileci_fail,
+    delta_failure_rate   = delta_fail     / n_samples,
+    profile_failure_rate = profile_fail   / n_samples
+  )
+}
+
+
+coverage_plots <- function(raw, true_rl) {
+  
+  raw     <- raw
+  true_rl <- true_rl
+  
+  n <- nrow(raw)
+  raw$iteration <- seq_len(n)
+  
+  raw$delta_covers <- raw$delta_lower <= true_rl & raw$delta_upper >= true_rl
+  raw$prof_covers  <- raw$prof_lower  <= true_rl & raw$prof_upper  >= true_rl
+  
+  # ── Delta plot ────────────────────────────────────────────────────────────────
+  p_delta <- ggplot(raw, aes(x = iteration, colour = delta_covers)) +
+  
+    geom_linerange(aes(ymin = delta_lower, ymax = delta_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = delta_rl), shape = 16, size = 1.5, alpha = 0.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", hjust = 0.5),
+      legend.position  = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin    = margin(4, 6, 4, 6)
+    )
+  
+  # ── Profile plot ──────────────────────────────────────────────────────────────
+  p_prof <- ggplot(raw, aes(x = iteration, colour = prof_covers)) +
+  
+    geom_linerange(aes(ymin = prof_lower, ymax = prof_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = prof_rl), shape = 16, size = 1.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor  = element_blank(),
+      plot.title        = element_text(face = "bold", hjust = 0.5),
+      legend.position   = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin     = margin(4, 6, 4, 6)
+    )
+  
+  list(
+    delta   = p_delta,
+    profile = p_prof
+  )
+}
+```
+
+
+## This is the noseasonality case for frechet into no_seasonality_frechet
+NOTE WE SHOULD CHANGE THE INSIDE CODE FOR x_samples AS REQUIRED SO RE RUN THE CODE ABOVE 
+Also rather than making individual tables for all versions here, we combine them at the bottom for one fat table 
+
+```{r No seasonality}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- rep(0, 12)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+nseg_frechet <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+noseasonality25_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+noseasonality50_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+noseasonality100_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(noseasonality25_frechet, 
+     noseasonality50_frechet, 
+     noseasonality100_frechet,  
+     nseg_frechet,
+     file = "no_seasonality_frechet.RData")
+```
+
+```{r No seasonality Data}
+load("no_seasonality_frechet.RData")
+
+noseasonality_frechet <- rbind(
+  noseasonality25_frechet$summary,
+  noseasonality50_frechet$summary,
+  noseasonality100_frechet$summary
+)
+
+noseasonality_frechet
+plot(nseg_frechet[1:(5*365)])
+nsbm_frechet <- block_max(nseg_frechet, 365)
+nsfit_frechet <- gev.fit(nsbm_frechet)
+gev.diag(nsfit_frechet)
+
+noseasonality100_frechet
+
+plots <- coverage_plots(
+  noseasonality100_frechet$raw, 
+  noseasonality100_frechet$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+
+```
+
+```{r No seasonal data table generation}
+
+load("no_seasonality_frechet.RData")
+
+noseasonality_frechet <- rbind(
+  noseasonality25_frechet$summary,
+  noseasonality50_frechet$summary,
+  noseasonality100_frechet$summary
+)
+
+################################################################################
+
+estimation_table_delta <- noseasonality_frechet |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    delta_rl,
+    RMSE_delta,
+    Bias_delta,
+    Bias_delta_med,
+    Coverage_delta,
+    delta_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Delta RL" = delta_rl,
+    "RMSE" = RMSE_delta,
+    "Bias" = Bias_delta,
+    "MD Bias" = Bias_delta_med,
+    "Coverage" = Coverage_delta,
+    "Width" = delta_width
+    
+  )
+
+estimation_table_delta <- estimation_table_delta |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_delta |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta Return level estimation performance of no seasonality Frechet.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("noseasonality_frechet_delta_rl.tex")
+
+###############################################################################
+
+estimation_table_prof <- noseasonality_frechet |>
+  select(
+    ReturnPeriod,
+    true_rl,
+    prof_rl,
+    RMSE_prof,
+    Bias_prof,
+    Bias_prof_med,
+    Coverage_prof,
+    prof_width
+  ) |>
+  rename(
+    "T" = ReturnPeriod,
+    "True RL" = true_rl,
+    "Profile RL" = prof_rl,
+    "RMSE" = RMSE_prof,
+    "Bias" = Bias_prof,
+    "MD Bias" = Bias_prof_med,
+    "Coverage" = Coverage_prof,
+    "Width" = prof_width
+  )
+
+estimation_table_prof <- estimation_table_prof |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+estimation_table_prof |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood Return level estimation performance of no seasonality Frechet.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("noseasonality_frechet_prof_rl.tex")
+
+```
+
+
+# S1 
+```{r Seasonal V1}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v1seg_frechet <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v1seasonality25_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v1seasonality50_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v1seasonality100_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v1seasonality25_frechet, 
+     v1seasonality50_frechet, 
+     v1seasonality100_frechet,  
+     v1seg_frechet,
+     file = "v1_seasonality_frechet.RData")
+```
+
+```{r V1 Seasonal Data}
+
+load("v1_seasonality_frechet.RData")
+
+v1seasonality_frechet <- rbind(
+  v1seasonality25_frechet$summary,
+  v1seasonality50_frechet$summary,
+  v1seasonality100_frechet$summary
+)
+
+v1seasonality_frechet
+plot(v1seg_frechet[1:(5*365)])
+v1sbm_frechet <- block_max(v1seg_frechet, 365)
+v1sfit_frechet <- gev.fit(v1sbm_frechet)
+gev.diag(v1sfit_frechet)
+
+v1seasonality100_frechet
+
+plots <- coverage_plots(
+  v1seasonality100_frechet$raw, 
+  v1seasonality100_frechet$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+```{r For generating the table}
+load("v1_seasonality_frechet.RData")
+
+v1seasonality_frechet <- rbind(
+  v1seasonality25_frechet$summary,
+  v1seasonality50_frechet$summary,
+  v1seasonality100_frechet$summary
+)
+
+
+```
+
+# S2
+```{r Seasonal V2}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,4,8,13,20,20,13,8,4,2,1)
+sigma       <- rep(1, 12)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v2seg_frechet <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v2seasonality25_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v2seasonality50_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v2seasonality100_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v2seasonality25_frechet, 
+     v2seasonality50_frechet, 
+     v2seasonality100_frechet,  
+     v2seg_frechet,
+     file = "v2_seasonality_frechet.RData")
+
+```
+
+```{r V2 seasonality Data}
+load("v2_seasonality_frechet.RData")
+
+v2seasonality_frechet <- rbind(
+  v2seasonality25_frechet$summary,
+  v2seasonality50_frechet$summary,
+  v2seasonality100_frechet$summary
+)
+
+v2seasonality_frechet
+plot(v2seg_frechet[1:(5*365)])
+v2sbm_frechet <- block_max(v2seg_frechet, 365)
+v2sfit_frechet <- gev.fit(v2sbm_frechet)
+gev.diag(v2sfit_frechet)
+
+v2seasonality100_frechet
+
+plots <- coverage_plots(
+  v2seasonality100_frechet$raw, 
+  v2seasonality100_frechet$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# S4 as noted before in Gumbel that this changed
+```{r Seasonal V3}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+sigma       <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v3seg_frechet <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v3seasonality25_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v3seasonality50_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v3seasonality100_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v3seasonality25_frechet, 
+     v3seasonality50_frechet, 
+     v3seasonality100_frechet,  
+     v3seg_frechet,
+     file = "v3_seasonality_frechet.RData")
+
+```
+
+```{r V3 seasonal Data}
+
+load("v3_seasonality_frechet.RData")
+
+v3seasonality_frechet <- rbind(
+  v3seasonality25_frechet$summary,
+  v3seasonality50_frechet$summary,
+  v3seasonality100_frechet$summary
+)
+
+v3seasonality_frechet
+plot(v3seg_frechet[1:(5*365)])
+v3sbm_frechet <- block_max(v3seg_frechet, 365)
+v3sfit_frechet <- gev.fit(v3sbm_frechet)
+gev.diag(v3sfit_frechet)
+
+v3seasonality100_frechet
+
+plots <- coverage_plots(
+  v3seasonality100_frechet$raw, 
+  v3seasonality100_frechet$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+# S3
+```{r Seasonal V4}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- rep(0,12)
+sigma       <- c(1,2,3,4,5,6,6,5,4,3,2,1)
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+v4seg_frechet <- x_samples(GEV_samples, mu, sigma)
+
+set.seed(123)
+v4seasonality25_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+v4seasonality50_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+v4seasonality100_frechet <- delta_prof(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(v4seasonality25_frechet, 
+     v4seasonality50_frechet, 
+     v4seasonality100_frechet,  
+     v4seg_frechet,
+     file = "v4_seasonality_frechet.RData")
+
+```
+
+```{r V4 seasonal Data}
+
+load("v4_seasonality_frechet.RData")
+
+v4seasonality_frechet <- rbind(
+  v4seasonality25_frechet$summary,
+  v4seasonality50_frechet$summary,
+  v4seasonality100_frechet$summary
+)
+
+v4seasonality_frechet
+plot(v4seg_frechet[1:(5*365)])
+v4sbm_frechet <- block_max(v4seg_frechet, 365)
+v4sfit_frechet <- gev.fit(v4sbm_frechet)
+gev.diag(v4sfit_frechet)
+
+v4seasonality100_frechet
+
+plots <- coverage_plots(
+  v4seasonality100_frechet$raw, 
+  v4seasonality100_frechet$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+
+# THIS IS THE BIG FAT TABLE
+```{r Fat table}
+
+load("no_seasonality_frechet.RData")
+
+noseasonality_frechet <- rbind(
+  noseasonality25_frechet$summary,
+  noseasonality50_frechet$summary,
+  noseasonality100_frechet$summary
+)
+
+load("v1_seasonality_frechet.RData")
+
+v1seasonality_frechet <- rbind(
+  v1seasonality25_frechet$summary,
+  v1seasonality50_frechet$summary,
+  v1seasonality100_frechet$summary
+)
+
+load("v2_seasonality_frechet.RData")
+
+v2seasonality_frechet <- rbind(
+  v2seasonality25_frechet$summary,
+  v2seasonality50_frechet$summary,
+  v2seasonality100_frechet$summary
+)
+
+load("v3_seasonality_frechet.RData")
+
+v3seasonality_frechet <- rbind(
+  v3seasonality25_frechet$summary,
+  v3seasonality50_frechet$summary,
+  v3seasonality100_frechet$summary
+)
+
+load("v4_seasonality_frechet.RData")
+
+v4seasonality_frechet <- rbind(
+  v4seasonality25_frechet$summary,
+  v4seasonality50_frechet$summary,
+  v4seasonality100_frechet$summary
+)
+
+prepare_table_delta <- function(x, scenario, method){
+  
+  if(method == "Delta"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        delta_rl,
+        RMSE_delta,
+        Bias_delta,
+        Bias_delta_med,
+        Coverage_delta,
+        delta_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = delta_rl,
+        RMSE = RMSE_delta,
+        Bias = Bias_delta,
+        `MD Bias` = Bias_delta_med,
+        Coverage = Coverage_delta,
+        Width = delta_width
+      )
+    
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+
+prepare_table_prof <- function(x, scenario, method){
+  
+  if(method == "Profile"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        prof_rl,
+        RMSE_prof,
+        Bias_prof,
+        Bias_prof_med,
+        Coverage_prof,
+        prof_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = prof_rl,
+        RMSE = RMSE_prof,
+        Bias = Bias_prof,
+        `MD Bias` = Bias_prof_med,
+        Coverage = Coverage_prof,
+        Width = prof_width
+      )
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+delta_all <- rbind(
+  prepare_table_delta(noseasonality_frechet, "NS", "Delta"),
+  prepare_table_delta(v1seasonality_frechet, "S1", "Delta"),
+  prepare_table_delta(v2seasonality_frechet, "S2", "Delta"),
+  prepare_table_delta(v4seasonality_frechet, "S3", "Delta"),
+  prepare_table_delta(v3seasonality_frechet, "S4", "Delta")
+)
+
+prof_all <- rbind(
+  prepare_table_prof(noseasonality_frechet, "NS", "Profile"),
+  prepare_table_prof(v1seasonality_frechet, "S1", "Profile"),
+  prepare_table_prof(v2seasonality_frechet, "S2", "Profile"),
+  prepare_table_prof(v4seasonality_frechet, "S3", "Profile"),
+  prepare_table_prof(v3seasonality_frechet, "S4", "Profile")
+)
+
+delta_all <- delta_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+prof_all <- prof_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+
+delta_all
+prof_all
+
+
+delta_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Delta method for Return level estimation performance for frechet.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("all_seasonality_frechet_delta.tex")
+
+prof_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile Likelihood method for Return level estimation performance for frechet.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("all_seasonality_frechet_prof.tex")
+
+
+
+
+
+```
+
+# Standardised version when I realised something is not right
+```{r Standardised table}
+
+load("no_seasonality_frechet.RData")
+
+noseasonality_frechet <- rbind(
+  noseasonality25_frechet$summary,
+  noseasonality50_frechet$summary,
+  noseasonality100_frechet$summary
+)
+
+load("v1_seasonality_frechet.RData")
+
+v1seasonality_frechet <- rbind(
+  v1seasonality25_frechet$summary,
+  v1seasonality50_frechet$summary,
+  v1seasonality100_frechet$summary
+)
+
+load("v2_seasonality_frechet.RData")
+
+v2seasonality_frechet <- rbind(
+  v2seasonality25_frechet$summary,
+  v2seasonality50_frechet$summary,
+  v2seasonality100_frechet$summary
+)
+
+load("v3_seasonality_frechet.RData")
+
+v3seasonality_frechet <- rbind(
+  v3seasonality25_frechet$summary,
+  v3seasonality50_frechet$summary,
+  v3seasonality100_frechet$summary
+)
+
+load("v4_seasonality_frechet.RData")
+
+v4seasonality_frechet <- rbind(
+  v4seasonality25_frechet$summary,
+  v4seasonality50_frechet$summary,
+  v4seasonality100_frechet$summary
+)
+
+LS_frechet <- tibble::tribble(
+  ~Scenario, ~L, ~S,
+  "NS",       0,  1,
+  "S1",       6,  1,
+  "S2",      20,  1,
+  "S3",       0,  6,
+  "S4",       6,  6
+)
+
+## ---------------------------------------------------------------
+## 2. Pull delta and profile results into one row per scenario/T
+## ---------------------------------------------------------------
+
+prepare_combined <- function(x, scenario) {
+  x |>
+    select(
+      ReturnPeriod,
+      true_rl,
+      prof_rl, delta_rl,
+      RMSE_prof, RMSE_delta,
+      Bias_prof, Bias_prof_med,
+      Coverage_delta, delta_width,
+      Coverage_prof,  prof_width
+    ) |>
+    mutate(Scenario = scenario, .before = 1)
+}
+
+combined_raw <- rbind(
+  prepare_combined(noseasonality_frechet, "NS"),
+  prepare_combined(v1seasonality_frechet, "S1"),
+  prepare_combined(v2seasonality_frechet, "S2"),
+  prepare_combined(v4seasonality_frechet, "S3"),   # v4 -> S3
+  prepare_combined(v3seasonality_frechet, "S4")    # v3 -> S4
+)
+
+## Sanity check: point estimates should agree between methods
+max_diff <- max(abs(combined_raw$prof_rl   - combined_raw$delta_rl),
+                abs(combined_raw$RMSE_prof - combined_raw$RMSE_delta))
+if (max_diff > 5e-4) {
+  warning("Delta and profile point estimates differ by up to ",
+          round(max_diff, 4),
+          ". Table reports the profile values only -- check before submitting.")
+}
+
+## ---------------------------------------------------------------
+## 3. Build the table, optionally standardised
+## ---------------------------------------------------------------
+build_frechet_table <- function(dat, LS, standardise = TRUE) {
+
+  dat |>
+    left_join(LS, by = "Scenario") |>
+    mutate(
+      shift = if (standardise) L else 0,
+      scale = if (standardise) S else 1
+    ) |>
+    transmute(
+      Scenario,
+      T        = ReturnPeriod,
+      Ref      = (true_rl - shift) / scale,
+      Est      = (prof_rl - shift) / scale,
+      RMSE     = RMSE_prof     / scale,
+      Bias     = Bias_prof     / scale,
+      `M Bias` = Bias_prof_med / scale,
+      DCovers  = Coverage_delta,
+      DWidth   = delta_width   / scale,
+      PCovers  = Coverage_prof,
+      PWidth   = prof_width    / scale
+    )
+}
+
+print_frechet_table <- function(tab, caption, label, file,
+                               digits = 3,
+                               digits_by_col = NULL) {
+
+  ## default: same precision everywhere
+  num_cols <- names(tab)[vapply(tab, is.numeric, logical(1))]
+  num_cols <- setdiff(num_cols, "T")
+
+  dg <- setNames(rep(digits, length(num_cols)), num_cols)
+  if (!is.null(digits_by_col)) {
+    dg[names(digits_by_col)] <- digits_by_col
+  }
+
+  chr <- tab
+  for (nm in num_cols) {
+    chr[[nm]] <- sprintf(paste0("%.", dg[[nm]], "f"), chr[[nm]])
+  }
+  chr$T <- as.character(chr$T)
+
+  chr$Scenario[duplicated(chr$Scenario)] <- ""
+
+  grp <- "& & \\multicolumn{2}{c}{Return Level} & \\multicolumn{3}{c}{Error} & \\multicolumn{2}{c}{Delta} & \\multicolumn{2}{c}{Profile} \\\\"
+  mid <- "\\cmidrule(lr){3-4} \\cmidrule(lr){5-7} \\cmidrule(lr){8-9} \\cmidrule(lr){10-11}"
+  nms <- "Scenario & T & Ref & Est & RMSE & Bias & M Bias & Covers & Width & Covers & Width \\\\"
+
+  header <- paste("\\toprule", grp, mid, nms, "\\midrule", sep = "\n")
+
+  n_per  <- 3L
+  breaks <- seq(n_per, nrow(chr) - n_per, by = n_per)
+
+  addtorow <- list(
+    pos     = c(list(-1), as.list(breaks), list(nrow(chr))),
+    command = c(header, rep("\\midrule\n", length(breaks)), "\\bottomrule\n")
+  )
+
+  xt <- xtable(chr,
+               caption = caption,
+               label   = label,
+               align   = paste0("ll", strrep("r", ncol(chr) - 1)))
+
+  print(xt,
+        file              = file,
+        include.rownames  = FALSE,
+        include.colnames  = FALSE,
+        hline.after       = NULL,
+        add.to.row        = addtorow,
+        booktabs          = TRUE,
+        caption.placement = "top",
+        sanitize.text.function = identity,
+        table.placement   = "ht")
+}
+
+std_table <- build_frechet_table(combined_raw, LS_frechet, standardise = TRUE)
+
+print_frechet_table(
+  std_table,
+  caption = "...",
+  label   = "tab:frechet_standardised",
+  file    = "frechet_standardised.tex",
+  digits  = 3,
+  digits_by_col = c(Ref = 3, Est = 3, DCovers = 3, PCovers = 3)
+)
+
+std_table
+```
+
+
+# Interesting case of some interesting result 
+Do not get rid of this one as this is probably one of the best odd cases you have 
+From an older version of producing results 
+
+```{r seasonal case 2, eval=FALSE}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+set.seed(123)
+
+GEV_samples <- 100 * 365
+n_samples <- 100 # number of n_samples 
+q_samples <- 100000 * 365
+
+rlcolnames <- c("rl10", "rl20", "rl100", "rl1000")
+T <- c(10,20,100,1000)  
+
+mu <- c(5,6,8,12,16,20,25,25,20,15,10,6)
+sigma <- rep(2,12)
+
+s2eg_frechet <- x_samples(GEV_samples, mu, sigma)
+s2bm_frechet <- block_max(s2eg_frechet, 365)
+s2fit_frechet <- gev.fit(s2bm_frechet)
+s2diag_frechet <- gev.diag(s2fit_frechet)
+
+set.seed(123)
+
+seasonal2_frechet <- delta_prof(GEV_samples, n_samples, q_samples, rlcolnames, T, mu, sigma)
+
+save(seasonal2_frechet, s2eg_frechet, s2bm_frechet, s2fit_frechet, s2diag_frechet, file = "seasonal2_frechet.RData")
+# could remove the sdiag_frechet as it seems like it doesnt get saved correctly somehow and just apply the gev.diag after as it does not seem to take too long anyway
+
+################################################################################
+# To print the table from what we have saved 
+
+load("seasonal2_frechet.RData")
+s2fit_frechet
+gev.diag(s2fit_frechet)
+seasonal2_frechet
+plot(s2eg_frechet[1:(5*365)])
+plot(s2eg_frechet)
+plot(s2bm_frechet)
+```
+
+```{r seasonal case 2, eval=FALSE}
+# Code used to save into no seasonality case for the gumbel no seasonality case
+################################################################################
+set.seed(123)
+
+GEV_samples <- 16 * 365
+n_samples <- 100 # number of n_samples 
+q_samples <- 100000 * 365
+
+rlcolnames <- c("rl10", "rl20", "rl100", "rl1000")
+T <- c(10,20,100,1000)  
+
+mu <- c(5,6,8,12,16,20,25,25,20,15,10,6)
+sigma <- rep(2,12)
+
+s3eg_frechet <- x_samples(GEV_samples, mu, sigma)
+s3bm_frechet <- block_max(s3eg_frechet, 365)
+s3fit_frechet <- gev.fit(s3bm_frechet)
+s3diag_frechet <- gev.diag(s3fit_frechet)
+
+set.seed(123)
+
+seasonal3_frechet <- delta_prof(GEV_samples, n_samples, q_samples, rlcolnames, T, mu, sigma)
+
+save(seasonal3_frechet, s3eg_frechet, s3bm_frechet, s3fit_frechet, s3diag_frechet, file = "seasonal3_frechet.RData")
+# could remove the sdiag_frechet as it seems like it doesnt get saved correctly somehow and just apply the gev.diag after as it does not seem to take too long anyway
+
+################################################################################
+# To print the table from what we have saved 
+
+load("seasonal3_frechet.RData")
+s3fit_frechet
+gev.diag(s3fit_frechet)
+seasonal3_frechet
+plot(s3eg_frechet[1:(5*365)])
+plot(s3eg_frechet)
+plot(s3bm_frechet)
+```

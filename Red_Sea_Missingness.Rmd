@@ -1,0 +1,1103 @@
+---
+title: "Red Sea Missingness"
+author: '25062476'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ismev) # Coles Package
+library(evmissing) # Simpson & Northrop package 
+library(readr) # for csv and things 
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+library(kableExtra)
+
+set.seed(123)
+
+load("Red_Sea_weekly.RData")
+```
+
+# Note that this is literally just for one case 
+One singular 50 year sample here 
+Testing here for all the cases that I would need 
+
+```{r Functions and pre run}
+x_samples_weekly <- function(n_samples, mu, sigma) {
+  week_days  <- rep(7, 51)
+  week_days  <- c(week_days, 8)
+  week_index <- rep(1:52, times = week_days)
+  week_index <- rep(week_index, n_samples / 365)
+  rnorm(length(week_index), mean = mu[week_index], sd = sigma[week_index])
+}
+
+block_max <- function(x, block_size) {
+  as.numeric(tapply(x, (seq_along(x) - 1) %/% block_size, max))
+}
+ 
+fit_and_extract <- function(x, block_length, T, discard = NULL, adjust = FALSE, min_blocks = 10) {
+ 
+  fit <- tryCatch(
+    suppressWarnings(
+      if (is.null(discard)) {
+        gev_mle(data = x, block_length = block_length, adjust = adjust)
+      } else {
+        gev_mle(data = x, block_length = block_length, adjust = adjust, discard = discard)
+      }
+    ),
+    error = function(e) NULL
+  )
+ 
+  n_blocks <- if (!is.null(fit)) length(fit$maxima) else 0L
+ 
+  if (is.null(fit) || fit$convergence != 0 || length(fit$par) != 3 ||
+      any(is.na(fit$par)) || n_blocks < min_blocks) {
+    return(c(rl = NA_real_, lower = NA_real_, upper = NA_real_, n_blocks = n_blocks))
+  }
+ 
+  ret <- tryCatch(gev_return(fit, m = T), error = function(e) NULL)
+  if (is.null(ret)) {
+    return(c(rl = NA_real_, lower = NA_real_, upper = NA_real_, n_blocks = n_blocks))
+  }
+  rl <- as.numeric(ret)
+ 
+  ci <- tryCatch(
+    suppressWarnings(confint(ret, profile = TRUE)),
+    error = function(e) NULL
+  )
+ 
+  if (is.null(ci)) {
+    return(c(rl = rl, lower = NA_real_, upper = NA_real_, n_blocks = n_blocks))
+  }
+ 
+  out <- c(rl = rl, lower = as.numeric(ci[1, 1]), upper = as.numeric(ci[1, 2]), n_blocks = n_blocks)
+  if (length(out) != 4) {
+    return(c(rl = NA_real_, lower = NA_real_, upper = NA_real_, n_blocks = n_blocks))
+  }
+  out
+}
+ 
+missing_prof_week <- function(GEV_samples, n_samples, q_samples, T, mu, sigma, loc_id,
+                               p_max = 0.2, discard_thresh = 15, verbose = TRUE) {
+ 
+  x_true  <- x_samples_weekly(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1 / T))
+ 
+  n_years <- GEV_samples / 365
+  methods <- c("full", "naive", "discard", "adjust")
+ 
+  col_names <- unlist(lapply(methods, function(m) paste0(m, c("_rl", "_lower", "_upper", "_nblocks"))))
+  results <- as.data.frame(matrix(NA_real_, nrow = n_samples, ncol = length(col_names)))
+  names(results) <- col_names
+ 
+  fail_counts <- setNames(rep(0L, length(methods)), methods)
+ 
+  for (i in seq_len(n_samples)) {
+ 
+    if (verbose && i %% max(1, n_samples %/% 20) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+ 
+    x_full <- x_samples_weekly(GEV_samples, mu, sigma)
+ 
+    years <- split(x_full, rep(seq_len(n_years), each = 365))
+    
+    for (yr in seq_len(n_years)) {
+      p <- runif(1, 0, p_max)
+      n_remove <- floor(p * 365)
+      if (n_remove > 0) {
+        miss <- sample(365, n_remove)
+        years[[yr]][miss] <- NA
+      }
+    }
+    x_missing <- unlist(years)
+ 
+    out <- fit_and_extract(x_full, block_length = 365, T = T)
+    results[i, c("full_rl", "full_lower", "full_upper", "full_nblocks")] <- out
+    if (is.na(out["rl"])) fail_counts["full"] <- fail_counts["full"] + 1L
+ 
+    out <- fit_and_extract(x_missing, block_length = 365, T = T, adjust = FALSE)
+    results[i, c("naive_rl", "naive_lower", "naive_upper", "naive_nblocks")] <- out
+    if (is.na(out["rl"])) fail_counts["naive"] <- fail_counts["naive"] + 1L
+ 
+    out <- fit_and_extract(x_missing, block_length = 365, T = T,
+                            discard = discard_thresh, adjust = FALSE)
+    results[i, c("discard_rl", "discard_lower", "discard_upper", "discard_nblocks")] <- out
+    if (is.na(out["rl"])) fail_counts["discard"] <- fail_counts["discard"] + 1L
+ 
+    out <- fit_and_extract(x_missing, block_length = 365, T = T, adjust = TRUE)
+    results[i, c("adjust_rl", "adjust_lower", "adjust_upper", "adjust_nblocks")] <- out
+    if (is.na(out["rl"])) fail_counts["adjust"] <- fail_counts["adjust"] + 1L
+  }
+ 
+  summarize_method <- function(prefix) {
+    rl      <- results[[paste0(prefix, "_rl")]]
+    lower   <- results[[paste0(prefix, "_lower")]]
+    upper   <- results[[paste0(prefix, "_upper")]]
+    nblocks <- results[[paste0(prefix, "_nblocks")]]
+ 
+    data.frame(
+      method       = prefix,
+      ReturnPeriod = T,
+      true_rl      = true_rl,
+      mean_rl      = mean(rl, na.rm = TRUE),
+      Bias_mean    = mean(rl - true_rl, na.rm = TRUE),
+      Bias_median  = median(rl - true_rl, na.rm = TRUE),
+      SD           = sd(rl, na.rm = TRUE),
+      RMSE         = sqrt(mean((rl - true_rl)^2, na.rm = TRUE)),
+      Coverage     = mean(lower <= true_rl & upper >= true_rl, na.rm = TRUE),
+      CI_width     = mean(upper - lower, na.rm = TRUE),
+      mean_n_blocks = mean(nblocks, na.rm = TRUE),
+      n_fail       = fail_counts[[prefix]],
+      n_valid      = sum(!is.na(rl))
+    )
+  }
+ 
+  summary_df <- do.call(rbind, lapply(methods, summarize_method))
+  rownames(summary_df) <- NULL
+ 
+  list(
+    summary     = summary_df,
+    raw         = results,
+    true_rl     = true_rl,
+    fail_counts = fail_counts
+  )
+}
+
+load("Red_Sea_weekly.RData")
+
+```
+
+# Location 1
+```{r To load and run the data }
+
+loc_id      <- 1
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+set.seed(123+loc_id) 
+missing_loc1_rs25 <- missing_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc1_rs50 <- missing_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc1_rs100 <- missing_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma, loc_id)
+
+print(missing_loc1_rs25$summary)
+print(missing_loc1_rs50$summary)
+print(missing_loc1_rs100$summary)
+
+save(missing_loc1_rs25, 
+     missing_loc1_rs50,
+     missing_loc1_rs100,
+     file = "missing_loc1_rs.RData")
+
+```
+
+# Location 2 
+```{r Second location}
+
+loc_id      <- 2
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+set.seed(123+loc_id) 
+missing_loc2_rs25 <- missing_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc2_rs50 <- missing_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc2_rs100 <- missing_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma, loc_id)
+
+print(missing_loc2_rs25$summary)
+print(missing_loc2_rs50$summary)
+print(missing_loc2_rs100$summary)
+
+save(missing_loc2_rs25, 
+     missing_loc2_rs50,
+     missing_loc2_rs100,
+     file = "missing_loc2_rs.RData")
+
+```
+
+# Location 3 
+```{r Third location}
+
+loc_id      <- 3
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+set.seed(123+loc_id) 
+missing_loc3_rs25 <- missing_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc3_rs50 <- missing_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc3_rs100 <- missing_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma, loc_id)
+
+print(missing_loc3_rs25$summary)
+print(missing_loc3_rs50$summary)
+print(missing_loc3_rs100$summary)
+
+save(missing_loc3_rs25, 
+     missing_loc3_rs50,
+     missing_loc3_rs100,
+     file = "missing_loc3_rs.RData")
+
+```
+
+# Location 4 
+```{r Fourth location}
+
+loc_id      <- 4
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+set.seed(123+loc_id) 
+missing_loc4_rs25 <- missing_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc4_rs50 <- missing_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc4_rs100 <- missing_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma, loc_id)
+
+print(missing_loc4_rs25$summary)
+print(missing_loc4_rs50$summary)
+print(missing_loc4_rs100$summary)
+
+save(missing_loc4_rs25, 
+     missing_loc4_rs50,
+     missing_loc4_rs100,
+     file = "missing_loc4_rs.RData")
+
+```
+
+# Location 5 
+```{r Fifth location}
+
+loc_id      <- 5
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+set.seed(123+loc_id) 
+missing_loc5_rs25 <- missing_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc5_rs50 <- missing_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma, loc_id)
+set.seed(123+loc_id) 
+missing_loc5_rs100 <- missing_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma, loc_id)
+
+print(missing_loc5_rs25$summary)
+print(missing_loc5_rs50$summary)
+print(missing_loc5_rs100$summary)
+
+save(missing_loc5_rs25, 
+     missing_loc5_rs50,
+     missing_loc5_rs100,
+     file = "missing_loc5_rs.RData")
+
+```
+
+# Data loading for location 1 to 3 for a table 
+Note that this is way too much data to include locations 1 to 5 as the standard 5 versions throughout the whole paper so only 3 are put here then the next 2 locations are put in another table
+```{r Loading locations 1 to 3}
+load("missing_loc1_rs.RData")
+load("missing_loc2_rs.RData")
+load("missing_loc3_rs.RData")
+load("missing_loc4_rs.RData")
+load("missing_loc5_rs.RData")
+
+print(missing_loc1_rs25$summary)
+print(missing_loc1_rs50$summary)
+print(missing_loc1_rs100$summary)
+
+print(missing_loc2_rs25$summary)
+print(missing_loc2_rs50$summary)
+print(missing_loc2_rs100$summary)
+
+print(missing_loc3_rs25$summary)
+print(missing_loc3_rs50$summary)
+print(missing_loc3_rs100$summary)
+
+print(missing_loc4_rs25$summary)
+print(missing_loc4_rs50$summary)
+print(missing_loc4_rs100$summary)
+
+print(missing_loc5_rs25$summary)
+print(missing_loc5_rs50$summary)
+print(missing_loc5_rs100$summary)
+```
+
+# Histogram of the return level histograms for the different methods
+```{r Producing histogram of the return levels and how the mean and median bias differs}
+load("missing_loc1_rs.RData")
+
+true_rl           <- missing_loc1_rs100$true_rl
+full_samples      <- missing_loc1_rs100$raw[, 1]
+naive_samples     <- missing_loc1_rs100$raw[, 5]
+discard_samples   <- missing_loc1_rs100$raw[, 9]
+adjust_samples    <- missing_loc1_rs100$raw[, 13]
+
+all_vals <- c(full_samples, naive_samples, discard_samples, adjust_samples)
+x_lims   <- c(28.35,29.2)
+# range(all_vals, na.rm = TRUE)
+
+make_hist_panel <- function(samples, label, true_rl, x_lims, bins = 30, show_x_title = TRUE) {
+
+  mean_val   <- mean(samples, na.rm = TRUE)
+  median_val <- median(samples, na.rm = TRUE)
+
+  df       <- data.frame(x = samples)
+  line_df  <- data.frame(
+    value = c(true_rl, mean_val, median_val),
+    type  = factor(
+      c("Ref RL", "Mean Bias", "Median Bias"),
+      levels = c("Ref RL", "Mean Bias", "Median Bias")
+    )
+  )
+
+  ggplot(df, aes(x = x)) +
+    geom_histogram(bins = bins, fill = "lightblue", color = "white") +
+    geom_vline(
+      data = line_df,
+      aes(xintercept = value, color = type, linetype = type),
+      linewidth = 1
+    ) +
+    scale_color_manual(
+      name   = NULL,
+      values = c("Ref RL" = "black", "Mean Bias" = "blue", "Median Bias" = "red"),
+      guide  = guide_legend(keywidth = unit(2, "cm"))
+    ) +
+    scale_linetype_manual(
+      name   = NULL,
+      values = c("Ref RL" = "solid", "Mean Bias" = "dashed", "Median Bias" = "dotted"),
+      guide  = guide_legend(keywidth = unit(2, "cm"))
+    ) +
+    coord_cartesian(xlim = x_lims) +
+    labs(title = label, 
+         x = if (show_x_title) "100 year return level" else NULL,
+         y = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title      = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+p11 <- make_hist_panel(full_samples,    "Full",    true_rl, x_lims, show_x_title = FALSE)
+p21 <- make_hist_panel(naive_samples,   "Naive",   true_rl, x_lims, show_x_title = FALSE)
+p31 <- make_hist_panel(discard_samples, "Discard", true_rl, x_lims, show_x_title = FALSE)
+p41 <- make_hist_panel(adjust_samples,  "Adjust",  true_rl, x_lims, show_x_title = TRUE)
+
+combined_loc1 <- (p11 / p21 / p31 / p41) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+      legend.key.height   = unit(0.8, "cm")
+      )
+
+combined_loc1
+
+###############################################################################
+
+
+
+```
+
+# Block maxima visualisation AND the histogram of GEV fit with the different methods
+```{r Block Maxima visualisation plots}
+
+set.seed(123)  
+
+loc_id      <- 1
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+x_full <- x_samples_weekly(GEV_samples, mu, sigma)
+n_years <- GEV_samples / 365
+years <- split(x_full, rep(seq_len(n_years), each = 365))
+for (yr in seq_len(n_years)) {
+  p <- runif(1, 0, 0.2)
+  n_remove <- floor(p * 365)
+  if (n_remove > 0) years[[yr]][sample(365, n_remove)] <- NA
+}
+x_missing <- unlist(years)
+
+fit_full    <- gev_mle(data = x_full,    block_length = 365, adjust = FALSE)
+fit_naive   <- gev_mle(data = x_missing, block_length = 365, adjust = FALSE)
+fit_discard <- gev_mle(data = x_missing, block_length = 365, adjust = FALSE, discard = 15)
+fit_adjust  <- gev_mle(data = x_missing, block_length = 365, adjust = TRUE)
+
+dgev <- function(x, mu, sigma, xi){
+  if (abs(xi) < 1e-8){
+    z <- (x - mu) / sigma
+    return(exp(-(z + exp(-z))) / sigma)
+  }
+  y <- 1 + xi * (x - mu) / sigma
+  dens <- ifelse(
+    y > 0,
+    (1/sigma) * y^(-1/xi - 1) * exp(-y^(-1/xi)),
+    0
+  )
+  dens
+}
+
+fits <- list(full = fit_full, naive = fit_naive, discard = fit_discard, adjust = fit_adjust)
+
+mu_full    <- fit_full$par["mu"];    sigma_full    <- fit_full$par["sigma"];    xi_full    <- fit_full$par["xi"]
+mu_naive   <- fit_naive$par["mu"];   sigma_naive   <- fit_naive$par["sigma"];   xi_naive   <- fit_naive$par["xi"]
+mu_discard <- fit_discard$par["mu"]; sigma_discard <- fit_discard$par["sigma"]; xi_discard <- fit_discard$par["xi"]
+mu_adjust  <- fit_adjust$par["mu"];  sigma_adjust  <- fit_adjust$par["sigma"];  xi_adjust  <- fit_adjust$par["xi"]
+
+bm_full <- fit_full$maxima
+x_grid  <- seq(min(bm_full), max(bm_full), length.out = 500)
+
+curve_all <- rbind(
+  data.frame(method = "full",    x = x_grid, density = dgev(x_grid, mu_full,    sigma_full,    xi_full)),
+  data.frame(method = "naive",   x = x_grid, density = dgev(x_grid, mu_naive,   sigma_naive,   xi_naive)),
+  data.frame(method = "discard", x = x_grid, density = dgev(x_grid, mu_discard, sigma_discard, xi_discard)),
+  data.frame(method = "adjust",  x = x_grid, density = dgev(x_grid, mu_adjust,  sigma_adjust,  xi_adjust))
+)
+
+method_levels <- c("full", "naive", "discard", "adjust")
+curve_all$method <- factor(curve_all$method, levels = method_levels)
+
+points_full <- data.frame(x = bm_full, y = 0)
+
+example_hist <- ggplot() +
+  geom_histogram(
+    data = data.frame(x = bm_full),
+    aes(x, after_stat(density)),
+    bins = 9,
+    fill = "lightblue",
+    colour = "black"
+  ) +
+  geom_line(
+    data = curve_all,
+    aes(x, density, colour = method, linetype = method),
+    linewidth = 1.1
+  ) +
+  geom_point(
+    data = points_full,
+    aes(x = x, y = 0),
+    size = 2
+  ) +
+  scale_colour_manual(values = c(full = "black", naive = "firebrick",
+                                  discard = "orange", adjust = "blue")) +
+  scale_linetype_manual(values = c(full = "solid", naive = "dashed",
+                                    discard = "dashed", adjust = "dashed")) +
+  labs(
+    x = "Annual maxima",
+    y = "Density",
+    colour = "Method",
+    linetype = "Method"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+      panel.grid.major = element_blank(),
+      plot.title       = element_text(face = "bold", hjust = 0.5),
+      legend.position  = c(0.85, 0.75),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin    = margin(4, 6, 4, 6),
+      legend.key.width   = unit(1.6, "cm")
+    )
+
+example_hist
+
+```
+
+# Double side by side plot of block maxima and the histogram of GEV fit
+```{r Same as above but with block maxima}
+set.seed(123)  
+
+loc_id      <- 1
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu          <- week_mean_all[,loc_id]
+sigma       <- week_sd_all[,loc_id]
+
+GEV_samples <- 50 * 365
+x_full  <- x_samples_weekly(GEV_samples, mu, sigma)
+n_years <- GEV_samples / 365
+
+years        <- split(x_full, rep(seq_len(n_years), each = 365))
+missing_flag <- rep(FALSE, GEV_samples)
+
+for (yr in seq_len(n_years)) {
+  p <- runif(1, 0, 0.2)
+  n_remove <- floor(p * 365)
+  if (n_remove > 0) {
+    miss <- sample(365, n_remove)
+    idx_in_full <- (yr - 1) * 365 + miss
+    missing_flag[idx_in_full] <- TRUE
+  }
+}
+
+df <- data.frame(
+  Index         = seq_len(GEV_samples),
+  Observations  = x_full,
+  Missing       = missing_flag
+)
+df$Observations_missing <- ifelse(df$Missing, NA, df$Observations)
+
+# Block maxima data frame 
+block_max_df <- function(df, value_col, block_size, na.rm = TRUE) {
+  block <- (df$Index - 1) %/% block_size
+  do.call(rbind, lapply(split(df, block), function(d) {
+    v <- d[[value_col]]
+    if (na.rm) d <- d[!is.na(v), ]
+    if (nrow(d) == 0) return(NULL)
+    d[which.max(d[[value_col]]), ]
+  }))
+}
+
+max_points_full    <- block_max_df(df, "Observations",          365, na.rm = FALSE)
+max_points_observed <- block_max_df(df, "Observations_missing", 365, na.rm = TRUE)
+
+# Left figure for building the block maxima similar to chapter 2 
+bm_full <- ggplot(df, aes(Index, Observations)) +
+  geom_point(aes(colour = "Observations"), size = 1.5) +
+  geom_vline(xintercept = seq(365, 365 * (n_years - 1), by = 365),
+             alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(colour = "Annual maxima"), data = max_points_full, size = 3) +
+  scale_colour_manual(values = c("Observations" = "lightblue", "Annual maxima" = "black")) +
+  labs(x = "Observation Index", y = "Data", colour = NULL, title = "Full data") +
+  guides(colour = guide_legend(override.aes = list(size = c(3, 3)))) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major   = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = c(0.75, 0.10),
+    legend.background  = element_rect(fill = "white", colour = "grey70"),
+    legend.margin      = margin(4, 6, 4, 6)
+  )
+
+# Right figure for building histogram similar to the histogram in chapter 2 
+bm_missing <- ggplot(df, aes(Index, Observations)) +
+  geom_point(aes(colour = "Observations"), size = 1.5) +
+  geom_point(data = subset(df, Missing), aes(colour = "Missing"), size = 1.5) +
+  geom_vline(xintercept = seq(365, 365 * (n_years - 1), by = 365),
+             alpha = 0.5, linetype = "dashed") +
+  geom_point(aes(colour = "Observed annual max"), data = max_points_observed, size = 3) +
+  scale_colour_manual(values = c(
+    "Observations"        = "lightblue",
+    "Missing"              = "firebrick",
+    "Observed annual max"  = "black"
+  )) +
+  labs(x = "Observation Index", y = "Data", colour = NULL, title = "Missing data mechanism applied") +
+  guides(colour = guide_legend(override.aes = list(size = c(3, 1.5, 3)))) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.major   = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    legend.position    = c(0.75, 0.10),
+    legend.background  = element_rect(fill = "white", colour = "grey70"),
+    legend.margin      = margin(4, 6, 4, 6)
+  )
+
+bm_full + bm_missing
+```
+
+# All missing individual simulation tables and the helper function used to make it
+```{r All the individual tables}
+
+prepare_table_missing <- function(rs_list, scenario) {
+  bind_rows(lapply(rs_list, function(x) x$summary)) |>
+    select(
+      ReturnPeriod,
+      method,
+      true_rl,
+      mean_rl,
+      RMSE,
+      Bias_mean,
+      Bias_median,
+      Coverage,
+      CI_width,
+      mean_n_blocks
+    ) |>
+    rename(
+      T          = ReturnPeriod,
+      Method     = method,
+      `True RL`  = true_rl,
+      `Est RL`   = mean_rl,
+      Bias       = Bias_mean,
+      `MD Bias`  = Bias_median,
+      Width      = CI_width,
+      `N Blocks` = mean_n_blocks
+    ) |>
+    mutate(
+      Scenario = scenario,
+      Method = factor(Method, levels = c("full", "naive", "discard", "adjust")),
+      .before = 1
+    ) |>
+    arrange(T, Method)
+}
+
+###############################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc1_rs25, missing_loc1_rs50, missing_loc1_rs100), "RS1"),
+  prepare_table_missing(list(missing_loc2_rs25, missing_loc2_rs50, missing_loc2_rs100), "RS2"),
+  prepare_table_missing(list(missing_loc3_rs25, missing_loc3_rs50, missing_loc3_rs100), "RS3")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 1 to 3. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc123.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc4_rs25, missing_loc4_rs50, missing_loc4_rs100), "RS4"),
+  prepare_table_missing(list(missing_loc5_rs25, missing_loc5_rs50, missing_loc5_rs100), "RS5")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 4 and 5. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdata45"
+  ) |>
+  save_kable("missingdataloc45.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc1_rs25, missing_loc1_rs50, missing_loc1_rs100), "RS1")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 1. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc1.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc2_rs25, missing_loc2_rs50, missing_loc2_rs100), "RS2")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 2. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc2.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc3_rs25, missing_loc3_rs50, missing_loc3_rs100), "RS3")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 3. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc3.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc4_rs25, missing_loc4_rs50, missing_loc4_rs100), "RS4")
+  )
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 4. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc4.tex")
+
+################################################################################
+
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc5_rs25, missing_loc5_rs50, missing_loc5_rs100), "RS5")
+)
+
+missing_all <- missing_all |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+missing_all
+
+missing_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Return level estimation performance for the weekly-seasonal Red Sea missing data simulation Locations 5. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:missingdatafull"
+  ) |>
+  save_kable("missingdataloc5.tex")
+
+
+
+
+```
+
+# Making it into a singular fat table 
+```{r Putting it into one }
+missing_all <- bind_rows(
+  prepare_table_missing(list(missing_loc1_rs25, missing_loc1_rs50, missing_loc1_rs100), "RS1"),
+  prepare_table_missing(list(missing_loc2_rs25, missing_loc2_rs50, missing_loc2_rs100), "RS2"),
+  prepare_table_missing(list(missing_loc3_rs25, missing_loc3_rs50, missing_loc3_rs100), "RS3"),
+  prepare_table_missing(list(missing_loc4_rs25, missing_loc4_rs50, missing_loc4_rs100), "RS4"),
+  prepare_table_missing(list(missing_loc5_rs25, missing_loc5_rs50, missing_loc5_rs100), "RS5")
+)
+
+```
+
+# Junkyard
+This is a bit of older stuff that I took my own time to just make without realising that the functions could have already been done by evmissing package
+
+```{r Testing functions}
+
+x_samples_weekly <- function(n_samples, mu, sigma) {
+  week_days  <- rep(7,51)
+  week_days <- c(week_days,8)
+  week_index <- rep(1:52, times = week_days)
+  week_index <- rep(week_index, n_samples/365)
+  rnorm(length(week_index), mean = mu[week_index], sd = sigma[week_index])
+}
+
+block_max <- function(x, block_size) {
+  as.numeric(
+    tapply(x,(seq_along(x) - 1) %/% block_size,max,na.rm = TRUE)
+  )
+}
+
+block_max_discard <- function(x, block_size, threshold = 0.15) {
+
+  f <- function(z){
+    prop_missing <- mean(is.na(z))
+    
+    if(prop_missing > threshold){
+      return(NA_real_)
+    }
+    max(z, na.rm = TRUE)
+  }
+
+  as.numeric(
+    tapply(
+      x,
+      (seq_along(x)-1) %/% block_size,
+      f
+    )
+  )
+}
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,1]
+sigma <- week_sd_all[,1]
+
+x_truth <- x_samples_weekly(q_samples, mu, sigma)
+
+x <- x_samples_weekly(GEV_samples, mu, sigma)
+
+y <- -log(1 - 1/100) # Note this 100 return level for all 
+
+years <- split(x, rep(1:50, each = 365))
+
+for(i in 1:50){
+
+    p <- runif(1, 0, 0.2)
+
+    n_remove <- floor(p * 365)
+
+    miss <- sample(365, n_remove)
+
+    years[[i]][miss] <- NA
+}
+
+x_missing <- unlist(years)
+
+################################## full version
+
+set.seed(123)
+
+bm_full <- block_max(x_truth,365)
+fit_full <- gev.fit(bm_full)
+
+# do not really need to see this diagnostic as it would just be hella perfect 
+
+#################################### naive version WITH DELTA ISMEV
+
+naive_bm <- block_max(x_missing,365)
+# plot(naive_bm)
+fit_naive <- gev.fit(naive_bm)
+gev.diag(fit_naive)
+
+#################################### discard version WITH DELTA ISMEV
+
+discard_bm <- block_max_discard(x_missing,365)
+discard_bm <- na.omit(discard_bm)
+# plot(discard_bm)
+fit_discard <- gev.fit(discard_bm)
+gev.diag(fit_discard)
+
+#################################### naive version with profile evmissing
+
+fit_naive_prof <- gev_mle(data = x_missing, 
+                      block_length = 365, 
+                      adjust = FALSE)
+
+plot(fit_naive_prof)
+
+#################################### discard version with profile evmissing
+
+fit_discard_prof <- gev_mle(data = x_missing, 
+                      block_length = 365, 
+                      adjust = FALSE,
+                      discard = 15)
+
+plot(fit_discard_prof)
+
+#################################### Adjust method for profile evmissing
+
+fit_adjust <- gev_mle(data = x_missing, 
+                      block_length = 365, 
+                      adjust = TRUE)
+
+plot(fit_adjust)
+
+
+####################################### 100 year rl for 
+# full, naive delta, discard delta, naive prof, discard prof, adjust prof
+
+fit_full$mle[1] + (fit_full$mle[2]/fit_full$mle[3]) * (y^(-fit_full$mle[3]) - 1)
+fit_naive$mle[1] + (fit_naive$mle[2]/fit_naive$mle[3]) * (y^(-fit_naive$mle[3]) - 1)
+fit_discard$mle[1] + (fit_discard$mle[2]/fit_discard$mle[3]) * (y^(-fit_discard$mle[3]) - 1)
+gev_return(fit_naive_prof)
+gev_return(fit_discard_prof)
+gev_return(fit_adjust)
+
+
+
+
+
+
+```
+
+```{r Attempt at the fat function}
+
+missing_prof_week <- function(GEV_samples, n_samples, q_samples, T, mu, sigma) {
+  
+  # For the true 100000 samples that we take as the quantile
+  x_true <- x_samples_weekly(q_samples, mu, sigma)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+  
+  # Results storage — one row per simulation
+  results <- data.frame(
+    full_rl     = numeric(n_samples),
+    full_lower  = numeric(n_samples),
+    full_upper  = numeric(n_samples),
+    
+    naive_rl     = numeric(n_samples),
+    naive_lower  = numeric(n_samples),
+    naive_upper  = numeric(n_samples),
+    
+    discard_rl     = numeric(n_samples),
+    discard_lower  = numeric(n_samples),
+    discard_upper  = numeric(n_samples),
+    
+    adjust_rl     = numeric(n_samples),
+    adjust_lower  = numeric(n_samples),
+    adjust_upper  = numeric(n_samples)
+  )
+  
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+    
+    x_full <- x_samples_weekly(GEV_samples, mu, sigma) # for full
+
+    y <- -log(1 - 1/100) # Note this 100 return level for all 
+    
+    years <- split(x_full, rep(1:50, each = 365))
+    
+    for(i in 1:50){
+        p <- runif(1, 0, 0.2)
+        n_remove <- floor(p * 365)
+        miss <- sample(365, n_remove)
+        years[[i]][miss] <- NA
+    }
+    
+    x_missing <- unlist(years) # use this for naive, discard, and adjust
+
+    # Profile likelihood
+    fit_full <- tryCatch(
+      suppressWarnings(gev_mle(x_full, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("full_rl", "full_lower", "full_upper")] <- NA
+    } else {
+      full_return <- gev_return(fit_full, m = T)
+      full_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("full_rl", "full_lower", "full_upper")] <- NA
+      } else {
+        results[i, "full_rl"]    <- as.numeric(full_return)
+        results[i, "full_lower"] <- full_conf[1, 1]
+        results[i, "full_upper"] <- full_conf[1, 2]
+      }
+    }
+  }
+  
+  # Summary
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+    
+    full_rl        = mean(results$full_rl,   na.rm = TRUE),
+    full_RMSE      = sqrt(mean((results$full_rl  - true_rl)^2, na.rm = TRUE)),
+    full_Bias      = mean(results$full_rl  - true_rl, na.rm = TRUE),
+    full_Bias_med  = median(results$full_rl  - true_rl, na.rm = TRUE),
+    full_Coverage  = mean(results$full_lower  <= true_rl & results$full_upper  >= true_rl, na.rm = TRUE),
+    full_width     = mean(results$full_upper - results$full_lower, na.rm=TRUE)
+    
+    
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,        # full simulation results if you need them
+    true_rl            = true_rl,
+  )
+  
+}
+
+```
+
+```{r 50 years for location one}
+################################################################################
+# For the sake of visibility I am going to write out all the things needed for computing this case again
+
+load("Red_Sea_weekly.RData")
+
+set.seed(123)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+mu <- week_mean_all[,1]
+sigma <- week_sd_all[,1]
+
+# Note that this is a bit inefficient but this generates every single one individually and to save it as well 
+# Doing the combination of all these functions took way too long and I think this is simply faster if you want a specific return level year
+
+set.seed(123)
+test50_redsea_25 <- delta_prof_week(GEV_samples, n_samples, q_samples, 25, mu, sigma)
+set.seed(123)
+test50_redsea_50 <- delta_prof_week(GEV_samples, n_samples, q_samples, 50, mu, sigma)
+set.seed(123)
+test50_redsea_100 <- delta_prof_week(GEV_samples, n_samples, q_samples, 100, mu, sigma)
+
+save(test50_redsea_25, 
+     test50_redsea_50,
+     test50_redsea_100,
+     file = "Test_run50_Red_Sea.RData")
+
+```
+
+```{r Test case 50 years Data}
+load("Test_run50_Red_Sea.RData")
+
+test50_redsea <- rbind(
+  test50_redsea_25$summary, 
+  test50_redsea_50$summary,
+  test50_redsea_100$summary
+)
+
+test50_redsea
+
+plots <- coverage_plots(
+  test50_redsea_100$raw, 
+  test50_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+```
+
+

@@ -1,0 +1,836 @@
+---
+title: "Red Sea Wave"
+author: '25062476'
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ismev) # Coles Package
+library(evmissing) # Simpson & Northrop package 
+library(readr) # for csv and things 
+library(ggplot2)
+library(dplyr)
+
+set.seed(123)
+
+load("Red_Sea_data.RData")
+load("Red_Sea_weekly.RData")
+```
+
+# This markdown documnt is generally for producing code for a harmonic function 
+Some parts are flipped: e.g. the data is produced from a chunk below then the residual plots of it are plotted in the chunk here:
+```{r residual plot of all values here}
+
+load("Red_Sea_data.RData")
+
+x <- data[, 1]
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+plot_df <- data.frame(
+  Day = day,
+  SST = x,
+  Seasonal = seasonal_mean
+)
+
+doy_plot <- ggplot(plot_df, aes(doy, SST)) +
+  geom_point(alpha = 0.3, colour = "lightblue") +
+  geom_line(
+    aes(y = Seasonal),
+    linewidth = 1,
+    colour = "blue"
+  ) +
+  labs(
+    x = "Day of year",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+doy_plot
+
+resid_df <- data.frame(
+  day   = day,
+  doy   = doy,
+  fitted = seasonal_mean,
+  r      = resid(fit_sin)
+  ) %>%
+  mutate(month = cut(doy, breaks = c(0, cumsum(c(31,28,31,30,31,30,31,31,30,31,30,31))),
+                     labels = month.abb))
+
+p_mean <- ggplot(resid_df, aes(doy, r)) +
+  geom_point(alpha = 1, colour = "lightblue", size = 1.2) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cc"), linewidth = 1.5 ,colour = "steelblue4", se = FALSE) +
+  labs(x = "Day of year", y = "Residual") +
+  theme_bw() + theme(panel.grid.minor = element_blank())
+
+p_mean
+```
+
+# Data cleaning to see how the smooth harmonic model could fit here
+```{r cleaning and plots}
+
+load("Red_Sea_data.RData")
+
+x <- data[, 1]
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+plot_df <- data.frame(
+  Day = day,
+  SST = x,
+  Seasonal = seasonal_mean
+)
+
+smooth_rs <- ggplot(plot_df, aes(Day, SST)) +
+  geom_line(alpha = 0.4, colour = "lightblue") +
+  geom_line(
+    aes(y = Seasonal),
+    linewidth = 1,
+    colour = "blue"
+  ) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+smooth_rs
+
+smooth_5yrs <- ggplot(plot_df[1:(5*365),], aes(Day, SST)) +
+  geom_line(alpha = 0.4, colour = "lightblue") +
+  geom_line(
+    aes(y = Seasonal),
+    linewidth = 1,
+    colour = "blue"
+  ) +
+  labs(
+    x = "Day",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+smooth_5yrs
+
+doy_plot <- ggplot(plot_df, aes(doy, SST)) +
+  geom_point(alpha = 0.3, colour = "lightblue") +
+  geom_line(
+    aes(y = Seasonal),
+    linewidth = 1,
+    colour = "blue"
+  ) +
+  labs(
+    x = "Day of year",
+    y = "Sea Surface Temperature (°C)"
+  ) +
+  theme_bw()
+
+doy_plot
+
+```
+
+# Adjusted code to sample from the smooth method 
+```{r Functions and initialisation}
+
+x_samples_sinusoidal <- function(n_samples, fit, residual_sd) {
+
+  day <- 1:n_samples
+
+  doy <- ((day - 1) %% 365) + 1
+
+  seasonal_mean <- predict(
+    fit,
+    newdata = data.frame(doy = doy)
+  )
+
+  seasonal_mean +
+    rnorm(
+      n_samples,
+      mean = 0,
+      sd = residual_sd
+    )
+}
+
+block_max <- function(x, block_size) {
+  as.numeric(tapply(x, (seq_along(x) - 1) %/% block_size, max))
+}
+
+delta_rl_CI <- function(T, fit) {
+  mu    <- fit$mle[1]
+  sigma <- fit$mle[2]
+  xi    <- fit$mle[3]
+  V     <- fit$cov
+  y     <- -log(1 - 1/T)
+
+  if (abs(xi) < 1e-6) {
+    rl     <- mu - sigma * log(y)
+    var_rl <- V[1,1] + (log(y))^2 * V[2,2] - 2 * log(y) * V[1,2]
+  } else {
+    rl      <- mu + (sigma/xi) * (y^(-xi) - 1)
+    grad_rl <- c(1, (y^(-xi) - 1)/xi, sigma * (1 - y^(-xi) - xi * y^(-xi) * log(y))/xi^2)
+    var_rl  <- as.numeric(t(grad_rl) %*% V %*% grad_rl)
+  }
+
+  se_rl <- sqrt(var_rl)
+  data.frame(ReturnLevel = rl, Lower = rl - 1.96 * se_rl, Upper = rl + 1.96 * se_rl)
+}
+
+delta_prof_wave <- function(GEV_samples, n_samples, q_samples, T, fit, residual_sd) {
+  
+  x_true <- x_samples_sinusoidal(q_samples, fit, residual_sd)
+  bm_true <- block_max(x_true, 365)
+  true_rl <- as.numeric(quantile(bm_true, probs = 1 - 1/T))
+
+  cat("True return level (T =", T, "):", round(true_rl, 4), "\n")
+
+  # Results storage — one row per simulation
+  results <- data.frame(
+    delta_rl    = numeric(n_samples),
+    delta_lower = numeric(n_samples),
+    delta_upper = numeric(n_samples),
+    prof_rl     = numeric(n_samples),
+    prof_lower  = numeric(n_samples),
+    prof_upper  = numeric(n_samples)
+  )
+
+  delta_fail     <- 0L
+  profile_fail   <- 0L
+  profileci_fail <- 0L
+
+  for (i in seq_len(n_samples)) {
+
+    if (i %% max(1, n_samples %/% 4) == 0)
+      cat(round(100 * i / n_samples), "% done\n")
+
+    x_dummy  <- x_samples_sinusoidal(GEV_samples, fit, residual_sd)
+    bm_dummy <- block_max(x_dummy, 365)
+
+    # Delta method
+    fit_delta <- tryCatch(
+      suppressWarnings(gev.fit(bm_dummy, show = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_delta)) {
+      delta_fail <- delta_fail + 1L
+      results[i, c("delta_rl", "delta_lower", "delta_upper")] <- NA
+    } else {
+      ci <- delta_rl_CI(T, fit_delta)
+      results[i, "delta_rl"]    <- ci$ReturnLevel
+      results[i, "delta_lower"] <- ci$Lower
+      results[i, "delta_upper"] <- ci$Upper
+    }
+
+    # Profile likelihood
+    fit_prof <- tryCatch(
+      suppressWarnings(gev_mle(bm_dummy, 1)),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit_prof) || any(is.na(fit_prof))) {
+      profile_fail <- profile_fail + 1L
+      results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+    } else {
+      prof_return <- gev_return(fit_prof, m = T)
+      prof_conf   <- tryCatch(
+        suppressWarnings(confint(prof_return, profile = TRUE)),
+        error = function(e) NULL
+      )
+
+      if (is.null(prof_conf)) {
+        profileci_fail <- profileci_fail + 1L
+        results[i, c("prof_rl", "prof_lower", "prof_upper")] <- NA
+      } else {
+        results[i, "prof_rl"]    <- as.numeric(prof_return)
+        results[i, "prof_lower"] <- prof_conf[1, 1]
+        results[i, "prof_upper"] <- prof_conf[1, 2]
+      }
+    }
+  }
+
+  # Summary
+  summary_df <- data.frame(
+    ReturnPeriod = T,
+    true_rl      = true_rl,
+
+    delta_rl   = mean(results$delta_rl,  na.rm = TRUE),
+    prof_rl    = mean(results$prof_rl,   na.rm = TRUE),
+
+    RMSE_delta = sqrt(mean((results$delta_rl - true_rl)^2, na.rm = TRUE)),
+    RMSE_prof  = sqrt(mean((results$prof_rl  - true_rl)^2, na.rm = TRUE)),
+
+    Bias_delta     = mean(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof      = mean(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Bias_delta_med = median(results$delta_rl - true_rl, na.rm = TRUE),
+    Bias_prof_med  = median(results$prof_rl  - true_rl, na.rm = TRUE),
+
+    Coverage_delta = mean(results$delta_lower <= true_rl &
+                          results$delta_upper >= true_rl, na.rm = TRUE),
+    Coverage_prof  = mean(results$prof_lower  <= true_rl &
+                          results$prof_upper  >= true_rl, na.rm = TRUE),
+    
+    delta_width    = mean(results$delta_upper - results$delta_lower, na.rm=TRUE),
+    prof_width     = mean(results$prof_upper - results$prof_lower, na.rm=TRUE)
+    
+  )
+
+  list(
+    summary            = summary_df,
+    raw                = results,        
+    true_rl            = true_rl,
+    delta_failures     = delta_fail,
+    profile_failures   = profile_fail,
+    profileci_failures = profileci_fail,
+    delta_failure_rate   = delta_fail     / n_samples,
+    profile_failure_rate = profile_fail   / n_samples
+  )
+}
+
+coverage_plots <- function(raw, true_rl) {
+  
+  raw     <- raw
+  true_rl <- true_rl
+  
+  n <- nrow(raw)
+  raw$iteration <- seq_len(n)
+  
+  raw$delta_covers <- raw$delta_lower <= true_rl & raw$delta_upper >= true_rl
+  raw$prof_covers  <- raw$prof_lower  <= true_rl & raw$prof_upper  >= true_rl
+  
+  # ── Delta plot ────────────────────────────────────────────────────────────────
+  p_delta <- ggplot(raw, aes(x = iteration, colour = delta_covers)) +
+  
+    geom_linerange(aes(ymin = delta_lower, ymax = delta_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = delta_rl), shape = 16, size = 1.5, alpha = 0.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", hjust = 0.5),
+      legend.position  = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin    = margin(4, 6, 4, 6)
+    )
+  
+  # ── Profile plot ──────────────────────────────────────────────────────────────
+  p_prof <- ggplot(raw, aes(x = iteration, colour = prof_covers)) +
+  
+    geom_linerange(aes(ymin = prof_lower, ymax = prof_upper),
+                   linewidth = 0.4, alpha = 0.7) +
+    geom_point(aes(y = prof_rl), shape = 16, size = 1.5) +
+  
+    scale_colour_manual(
+      name   = "Covers True Return Level",
+      values = c("TRUE" = "lightblue", "FALSE" = "blue"),
+      labels = c("TRUE" = "Yes", "FALSE" = "No")
+    ) +
+    
+    geom_hline(yintercept = true_rl,
+               linewidth = 0.5, colour = "black") +
+    annotate("text", x = 1, y = true_rl,
+             label = "True Return Level", hjust = 0, vjust = -0.4, size = 3.2,
+             colour = "black") +
+    
+    scale_x_continuous(
+      name   = "Iteration",
+      breaks = seq(0, n, by = 100),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    scale_y_continuous(name = "Return Level") +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor  = element_blank(),
+      plot.title        = element_text(face = "bold", hjust = 0.5),
+      legend.position   = c(0.18, 0.85),
+      legend.background = element_rect(fill = "white", colour = "grey70"),
+      legend.margin     = margin(4, 6, 4, 6)
+    )
+  
+  list(
+    delta   = p_delta,
+    profile = p_prof
+  )
+}
+
+```
+
+# Location 1 
+```{r Location 1 smooth}
+load("Red_Sea_data.RData")
+
+x <- data[, 1] # this is only for location 1 
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+residuals <- x - seasonal_mean
+resid_sd <- sd(residuals)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+set.seed(123)
+smooth_loc1_redsea_25 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 25, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc1_redsea_50 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 50, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc1_redsea_100 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 100, fit_sin, resid_sd)
+
+
+save(smooth_loc1_redsea_25, 
+     smooth_loc1_redsea_50,
+     smooth_loc1_redsea_100,
+     file = "smooth_loc1_Red_Sea.RData")
+
+
+```
+
+```{r Location 1 Data}
+
+load("smooth_loc1_Red_Sea.RData")
+
+smooth_loc1_redsea <- rbind(
+  smooth_loc1_redsea_25$summary, 
+  smooth_loc1_redsea_50$summary,
+  smooth_loc1_redsea_100$summary
+)
+
+smooth_loc1_redsea
+
+plots <- coverage_plots(
+  smooth_loc1_redsea_100$raw, 
+  smooth_loc1_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+
+# Location 2
+```{r Location 2 smooth}
+
+x <- data[, 2] 
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+residuals <- x - seasonal_mean
+resid_sd <- sd(residuals)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+set.seed(123)
+smooth_loc2_redsea_25 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 25, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc2_redsea_50 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 50, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc2_redsea_100 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 100, fit_sin, resid_sd)
+
+
+save(smooth_loc2_redsea_25, 
+     smooth_loc2_redsea_50,
+     smooth_loc2_redsea_100,
+     file = "smooth_loc2_Red_Sea.RData")
+
+
+```
+
+```{r Location 2 Data}
+
+load("smooth_loc2_Red_Sea.RData")
+
+smooth_loc2_redsea <- rbind(
+  smooth_loc2_redsea_25$summary, 
+  smooth_loc2_redsea_50$summary,
+  smooth_loc2_redsea_100$summary
+)
+
+smooth_loc2_redsea
+
+plots <- coverage_plots(
+  smooth_loc2_redsea_100$raw, 
+  smooth_loc2_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+# Location 3
+```{r Location 3 smooth}
+
+x <- data[, 3] 
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+residuals <- x - seasonal_mean
+resid_sd <- sd(residuals)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+set.seed(123)
+smooth_loc3_redsea_25 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 25, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc3_redsea_50 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 50, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc3_redsea_100 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 100, fit_sin, resid_sd)
+
+
+save(smooth_loc3_redsea_25, 
+     smooth_loc3_redsea_50,
+     smooth_loc3_redsea_100,
+     file = "smooth_loc3_Red_Sea.RData")
+
+
+```
+
+```{r Location 3 Data}
+
+load("smooth_loc3_Red_Sea.RData")
+
+smooth_loc3_redsea <- rbind(
+  smooth_loc3_redsea_25$summary, 
+  smooth_loc3_redsea_50$summary,
+  smooth_loc3_redsea_100$summary
+)
+
+smooth_loc3_redsea
+
+plots <- coverage_plots(
+  smooth_loc3_redsea_100$raw, 
+  smooth_loc3_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+
+# Location 4
+```{r Location 4 smooth}
+
+x <- data[, 4] 
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+residuals <- x - seasonal_mean
+resid_sd <- sd(residuals)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+set.seed(123)
+smooth_loc4_redsea_25 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 25, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc4_redsea_50 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 50, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc4_redsea_100 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 100, fit_sin, resid_sd)
+
+
+save(smooth_loc4_redsea_25, 
+     smooth_loc4_redsea_50,
+     smooth_loc4_redsea_100,
+     file = "smooth_loc4_Red_Sea.RData")
+
+
+```
+
+```{r Location 4 Data}
+
+load("smooth_loc4_Red_Sea.RData")
+
+smooth_loc4_redsea <- rbind(
+  smooth_loc4_redsea_25$summary, 
+  smooth_loc4_redsea_50$summary,
+  smooth_loc4_redsea_100$summary
+)
+
+smooth_loc4_redsea
+
+plots <- coverage_plots(
+  smooth_loc4_redsea_100$raw, 
+  smooth_loc4_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+# Location 5
+```{r Location 5 smooth}
+
+x <- data[, 5] 
+
+n <- length(x)
+
+day <- 1:n
+
+# Position within the year
+doy <- ((day - 1) %% 365) + 1
+
+fit_sin <- lm(
+  x ~ sin(2 * pi * doy / 365) +
+      cos(2 * pi * doy / 365)
+)
+
+seasonal_mean <- predict(fit_sin)
+
+residuals <- x - seasonal_mean
+resid_sd <- sd(residuals)
+
+GEV_samples <- 50 * 365
+n_samples   <- 1000
+q_samples   <- 100000 * 365
+
+set.seed(123)
+smooth_loc5_redsea_25 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 25, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc5_redsea_50 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 50, fit_sin, resid_sd)
+set.seed(123)
+smooth_loc5_redsea_100 <- delta_prof_wave(GEV_samples, n_samples, q_samples, 100, fit_sin, resid_sd)
+
+
+save(smooth_loc5_redsea_25, 
+     smooth_loc5_redsea_50,
+     smooth_loc5_redsea_100,
+     file = "smooth_loc5_Red_Sea.RData")
+
+
+```
+
+```{r Location 5 Data}
+
+load("smooth_loc5_Red_Sea.RData")
+
+smooth_loc5_redsea <- rbind(
+  smooth_loc5_redsea_25$summary, 
+  smooth_loc5_redsea_50$summary,
+  smooth_loc5_redsea_100$summary
+)
+
+smooth_loc5_redsea
+
+plots <- coverage_plots(
+  smooth_loc5_redsea_100$raw, 
+  smooth_loc5_redsea_100$summary$true_rl
+  )
+
+plots$delta
+plots$profile
+
+```
+
+
+# THE FAT TABLE FOR LOCATIONS 1 to 5 
+```{r Table code}
+
+load("smooth_loc1_Red_Sea.RData")
+
+smooth_loc1_redsea <- rbind(
+  smooth_loc1_redsea_25$summary, 
+  smooth_loc1_redsea_50$summary,
+  smooth_loc1_redsea_100$summary
+)
+
+load("smooth_loc2_Red_Sea.RData")
+
+smooth_loc2_redsea <- rbind(
+  smooth_loc2_redsea_25$summary, 
+  smooth_loc2_redsea_50$summary,
+  smooth_loc2_redsea_100$summary
+)
+
+load("smooth_loc3_Red_Sea.RData")
+
+smooth_loc3_redsea <- rbind(
+  smooth_loc3_redsea_25$summary, 
+  smooth_loc3_redsea_50$summary,
+  smooth_loc3_redsea_100$summary
+)
+
+load("smooth_loc4_Red_Sea.RData")
+
+smooth_loc4_redsea <- rbind(
+  smooth_loc4_redsea_25$summary, 
+  smooth_loc4_redsea_50$summary,
+  smooth_loc4_redsea_100$summary
+)
+
+
+load("smooth_loc5_Red_Sea.RData")
+
+smooth_loc5_redsea <- rbind(
+  smooth_loc5_redsea_25$summary, 
+  smooth_loc5_redsea_50$summary,
+  smooth_loc5_redsea_100$summary
+)
+
+
+prepare_table_prof <- function(x, scenario, method){
+  
+  if(method == "Profile"){
+    
+    x |>
+      select(
+        ReturnPeriod,
+        true_rl,
+        prof_rl,
+        RMSE_prof,
+        Bias_prof,
+        Bias_prof_med,
+        Coverage_prof,
+        prof_width
+      ) |>
+      rename(
+        T = ReturnPeriod,
+        `True RL` = true_rl,
+        `Est RL` = prof_rl,
+        RMSE = RMSE_prof,
+        Bias = Bias_prof,
+        `MD Bias` = Bias_prof_med,
+        Coverage = Coverage_prof,
+        Width = prof_width
+      )
+  } |>
+    mutate(
+      Scenario = scenario,
+      .before = 1
+    )
+}
+
+
+prof_all <- rbind(
+  prepare_table_prof(smooth_loc1_redsea, "RS1", "Profile"),
+  prepare_table_prof(smooth_loc2_redsea, "RS2", "Profile"),
+  prepare_table_prof(smooth_loc3_redsea, "RS3", "Profile"),
+  prepare_table_prof(smooth_loc4_redsea, "RS4", "Profile"),
+  prepare_table_prof(smooth_loc5_redsea, "RS5", "Profile")
+)
+
+
+prof_all <- prof_all |>
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+prof_all |>
+  kbl(
+    format = "latex",
+    booktabs = TRUE,
+    caption = "Profile likelihood return level estimation performance for the smooth harmonic Red Sea simulation Locations 1 to 5. True return levels are obtained from the 100,000 year reference sample generated under the same weekly mean/sd structure.",
+    label = "tab:estimation"
+  ) |>
+  save_kable("smooth_loc12345_RS_table.tex")
+
+
+
+```
