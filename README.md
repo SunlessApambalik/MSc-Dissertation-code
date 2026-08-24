@@ -1,5 +1,6 @@
 The Files can be summarised by the Chapters of the dissertation as follows: 
 
+**All Chapters** <br />
 M4A Combination: Mainly a mixture of code for the different chapter that produces figures for the paper
 
 **Chapter 3 (Simulations) ** <br />
