@@ -345,6 +345,45 @@ p1 / p4
 p5
 bias_combo
 
+#############################################################################
+# Produce the map of the coverage and the interval width 
+
+coords <- as.data.frame(loc) |>
+  setNames(c("lon", "lat")) |>
+  mutate(Location = row_number())
+
+map_df <- left_join(red100, coords, by = "Location")
+stopifnot(!any(is.na(map_df$lon)))
+
+lim_cov <- 0.95 + c(-1, 1) * max(abs(map_df$Coverage_prof - 0.95))
+
+base_map <- list(
+  coord_quickmap(),
+  theme_bw(),
+  theme(panel.grid = element_blank(),
+        legend.position = "right",
+        legend.key.height = unit(1.1, "cm"))
+)
+
+p_cov <- ggplot(map_df, aes(lon, lat, fill = Coverage_prof)) +
+  geom_point(shape = 21, size = 4.5, stroke = 0.25, colour = "grey25") +
+  scale_fill_gradient2(
+    name = "Coverage", midpoint = 0.95, limits = lim_cov,
+    low = "steelblue", mid = "grey95", high = "red"
+  ) +
+  labs(x = "Longitude", y = "Latitude") +
+  base_map +
+  theme_bw()
+
+p_wid <- ggplot(map_df, aes(lon, lat, fill = prof_width)) +
+  geom_point(shape = 21, size = 4.5, stroke = 0.25, colour = "grey25") +
+  scale_fill_viridis_c(name = "Interval\nwidth", option = "mako", direction = -1) +
+  labs(x = "Longitude", y = NULL) +
+  base_map +
+  theme_bw()
+
+# two by one graph with scale filled for coverage and interval width 
+p_cov | p_wid
 
 ```
 
